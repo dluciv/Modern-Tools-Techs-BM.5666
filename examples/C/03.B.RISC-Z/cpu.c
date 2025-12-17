@@ -7,6 +7,7 @@
 #include "misc.h"
 #include "cpu.h"
 #include "memory.h"
+#include "ecall.h"
 
 #define FUNC3_OFFS 12
 #define FUNC7_OFFS 24
@@ -16,7 +17,7 @@
 
 /**
  * @brief Opcodes to determine instruction format
- * 
+ *
  */
 enum rz_formats : unsigned { // C23
     LUI_FORMAT    = 0b0110111u,
@@ -33,7 +34,7 @@ enum rz_formats : unsigned { // C23
 
 /**
  * @brief R-format CODE | F3 | F7
- * 
+ *
  */
  enum rz_r_codes : unsigned {
     ADD_CODE = R_FORMAT | ( 0b000u << FUNC3_OFFS ) | ( 0b0000000u << FUNC7_OFFS ),
@@ -43,7 +44,7 @@ enum rz_formats : unsigned { // C23
 
  /**
   * @brief I-format code | F3 [ | F7 ]
-  * 
+  *
   */
 enum rz_i_codes : unsigned {
     ADDI_CODE = I_FORMAT | ( 0b000u << FUNC3_OFFS ),
@@ -52,7 +53,7 @@ enum rz_i_codes : unsigned {
 
 /**
  * @brief U-format code
- * 
+ *
  */
 enum rz_u_codes : unsigned {
     LUI_CODE = LUI_FORMAT,
@@ -66,7 +67,7 @@ enum rz_sys_codes : unsigned {
 
 /**
  * @brief Represent RISC-V machine code for LE host-machines
- * 
+ *
  */
 typedef union {
     rz_register_t whole;
@@ -187,7 +188,7 @@ bool rz_i_cycle(rz_cpu_p pcpu, rz_instruction_t instr) {
 bool rz_sys_cycle(rz_cpu_p pcpu, rz_instruction_t instr) {
     switch(instr.whole & (1u << 20)){
         case 0:
-            return true; // return rz_ecall();
+            return rz_userland_ecall(pcpu->r_x);
         case 1:
         default:
             return false;
