@@ -1,26 +1,25 @@
 CC=cc
 LD=$(CC)
-CCOPT=
 
-%.o : %.c
-	$(CC) -c $(CCOPT) -o $@ $<
+all: release debug debug_test
 
-program : release
+CCOPT_R += -O3 -DNDEBUG
+CCOPT_D += -g -DDEBUG
 
-# test target too
-
-release   : CCOPT += -O3 -DNDEBUG
-debug     : CCOPT += -g -DDEBUG
-debug_test: CCOPT += -g -DDEBUG
-
-release    : main.o      image.o fractal.o
+release    : main.r.o      image.r.o fractal.r.o
 	$(LD) -o $@ $^
 
-debug      : main.o      image.o fractal.o
+debug      : main.d.o      image.d.o fractal.d.o
 	$(LD) -o $@ $^
 
-debug_test : test_main.o image.o fractal.o
+debug_test : test_main.d.o image.d.o fractal.d.o
 	$(LD) -o $@ $^
+
+%.d.o : %.c
+	$(CC) -c $(CCOPT_D) -o $@ $<
+
+%.r.o : %.c
+	$(CC) -c $(CCOPT_R) -o $@ $<
 
 clean :
 	- rm *.o
