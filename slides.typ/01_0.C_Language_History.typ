@@ -1,6 +1,5 @@
 #import "res/spbu.typ": *
 
-#show: spbu-setup
 #show: spbu-theme.with(
   config-info(
     title: [Историческая справка: особенности языка C и его экосистемы],
@@ -14,6 +13,7 @@
     ),
   ),
 )
+#show: spbu-setup
 
 // ---- Титульный слайд ----
 #title-slide(
