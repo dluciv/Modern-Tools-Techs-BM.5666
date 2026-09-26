@@ -54,5 +54,30 @@
     primary: terracotta,
     secondary: pantone,
   ),
+  config-store(
+    navigation: self => {
+      context {
+        let current-heading = utils.current-heading(level: 1)
+        let current-heading-name = if current-heading != none {
+          current-heading.body
+        } else { "" }
+
+        grid(
+          columns: (1fr, 1fr),
+          block(
+            width: 100%, height: 0.8em,
+            fill: self.colors.primary,
+            place(left + horizon, text(current-heading-name, fill: self.colors.neutral-lightest, size: 0.7em), dx: 0.3em),
+          ),
+          block(
+            width: 100%, height: 0.8em,
+            fill: self.colors.primary,
+          ),
+        )
+      }
+    },
+  ),
   progress-bar: true,
 )
+
+#let dia(c) = { c + "\u{0308}" }
