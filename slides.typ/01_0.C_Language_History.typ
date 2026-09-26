@@ -1,7 +1,7 @@
 #import "res/spbu.typ": *
 
 #show: spbu-setup
-#show: clean-math-presentation-theme.with(
+#show: spbu-theme.with(
   config-info(
     title: [Историческая справка: особенности языка C и его экосистемы],
     short-title: [Язык C],
@@ -13,11 +13,6 @@
       (id: 1, name: "СПбГУ"),
     ),
   ),
-  config-colors(
-    primary: terracotta,
-    secondary: pantone,
-  ),
-  progress-bar: true,
 )
 
 // ---- Титульный слайд ----

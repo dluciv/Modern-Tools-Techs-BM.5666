@@ -22,3 +22,14 @@
   show enum: set enum(spacing: 10pt, numbering: n => move(dy: 0.35em, _num-icon(n)))
   body
 }
+
+// Обёртка над clean-math-presentation с настройками СПбГУ.
+// Использование:
+//   #show: spbu-theme.with(config-info(title: [...], author: [...]))
+#let spbu-theme = clean-math-presentation-theme.with(
+  config-colors(
+    primary: terracotta,
+    secondary: pantone,
+  ),
+  progress-bar: true,
+)
