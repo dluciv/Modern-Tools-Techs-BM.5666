@@ -41,7 +41,7 @@
 #let spbu-setup(body) = {
   set text(lang: "ru")
   set text(font: "Cuprum", size: 18pt)
-  show raw: set text(font: "Iosevka NF", size: 17.5pt)
+  show raw: set text(font: "Iosevka NF", size: 16pt)
   show math.equation: set text(font: "New Computer Modern Math")
   show enum: set enum(spacing: 10pt, numbering: n => _num-icon(n))
   show list: set list(marker: _bullet-icon)
