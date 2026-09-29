@@ -1,4 +1,4 @@
-#import "res/spbu.typ": *
+#import "spbu-se/spbu.typ": *
 
 #import "@preview/zebraw:0.6.3": *
 #show: zebraw
@@ -21,7 +21,7 @@
 
 // ---- Титульный слайд ----
 #title-slide(
-  logo1: image("res/spbu_grey.svg", height: 4.5em),
+  logo1: image("spbu-se/spbu_grey.svg", height: 4.5em),
 )
 
 // ========================== СЛАЙДЫ ==========================

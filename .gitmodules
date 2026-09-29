@@ -6,3 +6,6 @@
 	path = examples/C/YY.utest
 	url = https://github.com/sheredom/utest.h.git
 	branch = main
+[submodule "slides.typ/spbu-se-typst-slides"]
+	path = slides.typ/spbu-se-typst-slides
+	url = https://git@git.sourcecraft.dev/spbu-se/typst-slides-template.git
