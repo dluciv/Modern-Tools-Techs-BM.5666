@@ -40,7 +40,7 @@ class SafeCalculator:
             # ни одной встроенной функции — вызвать их нельзя.
             result = eval(expression, {"__builtins__": {}}, {})
             return str(result)
-        except Exception:
+        except Exception:  # noqa: BLE001 — список ошибок eval заранее неизвестен
             # Сюда попадают ZeroDivisionError, NameError и т.п.
             # Ловим Exception, а не голый except: тот заодно перехватывает
             # Ctrl-C, а это не ошибка калькулятора.

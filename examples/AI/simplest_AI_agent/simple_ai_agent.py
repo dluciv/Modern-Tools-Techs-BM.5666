@@ -16,225 +16,43 @@ Simple AI agent
    (`{"tool": ..., "args": {...}}`). Нужен для моделей без function calling
    и чтобы посмотреть, как тот же агент работает с ними (--no-native-tools).
 
-Настройки провайдера не хранятся в коде, а берутся из конфигов opencode:
-
-  * API-ключ      — ~/.local/share/opencode/auth.json
-  * baseURL, модели — ~/.config/opencode/opencode.jsonc
-
 Запуск:
     ./simple_ai_agent.py                      # провайдер из OPENCODE_PROVIDER
     ./simple_ai_agent.py routerai-ru
     ./simple_ai_agent.py routerai-ru --model xiaomi/mimo-v2.5
+    ./simple_ai_agent.py --log               # показать обмен с моделью
     ./simple_ai_agent.py --no-native-tools    # принудительно текстовый протокол
     ./simple_ai_agent.py --list-providers
+
+Три файла рядом:
+    simple_ai_agent.py  — этот файл: цикл агента
+    safe_agent_tools.py — сами инструменты (калькулятор, ФС, поиск)
+    opencode_config.py  — чтение конфигов opencode (ключи, baseURL)
+    agent_log.py        — журнал общения с моделью (--log)
 """
 import argparse
 import json
 import os
 import re
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import requests
 
-from safe_agent_tools import VirtualFileSystem, DocumentationSearch, SafeCalculator
+from agent_log import ConversationLog
+from opencode_config import (
+    AUTH_FILE,
+    Provider,
+    available_providers,
+    load_provider,
+    mask_key,
+)
+from safe_agent_tools import DocumentationSearch, SafeCalculator, VirtualFileSystem
 
 DEFAULT_PROVIDER = "routerai-ru"
 DEFAULT_MAX_STEPS = 8
-
-
-def _xdg(env_var: str, default: str) -> Path:
-    """Путь по XDG-спецификации (с учётом $XDG_DATA_HOME / $XDG_CONFIG_HOME)."""
-    value = os.environ.get(env_var)
-    return Path(value) if value else Path.home() / default
-
-
-AUTH_FILE = _xdg("XDG_DATA_HOME", ".local/share") / "opencode" / "auth.json"
-CONFIG_FILE = _xdg("XDG_CONFIG_HOME", ".config") / "opencode" / "opencode.jsonc"
-
-
-# --------------------------------------------------------------------------- #
-# Чтение конфигов opencode
-# --------------------------------------------------------------------------- #
-
-def strip_jsonc(text: str) -> str:
-    """Убирает // и /* */ комментарии из JSONC.
-
-    Важно: нельзя тупо regex-ать `//`, потому что в baseURL живёт
-    "https://routerai.ru/api/v1" — такой URL разъехался бы на два.
-    Поэтому идём посимвольно и следим за кавычками.
-    """
-    out: list[str] = []
-    i, n = 0, len(text)
-    in_string = False
-    last_comma = -1  # позиция последней запятой вне строки
-
-    while i < n:
-        ch = text[i]
-
-        if in_string:
-            out.append(ch)
-            if ch == "\\" and i + 1 < n:
-                out.append(text[i + 1])
-                i += 2
-                continue
-            if ch == '"':
-                in_string = False
-            i += 1
-            continue
-
-        if ch == '"':
-            in_string = True
-            last_comma = -1
-            out.append(ch)
-            i += 1
-            continue
-
-        if text.startswith("//", i):
-            while i < n and text[i] != "\n":
-                i += 1
-            continue
-
-        if text.startswith("/*", i):
-            end = text.find("*/", i + 2)
-            i = n if end == -1 else end + 2
-            last_comma = -1
-            continue
-
-        if ch == ",":
-            last_comma = len(out)
-            out.append(ch)
-            i += 1
-            continue
-
-        if ch in "}]":
-            # Хвостовая запятая: {"a": 1,} — JSON её не терпит, а редакторы любят
-            if last_comma != -1:
-                out[last_comma] = " "
-            last_comma = -1
-
-        if not ch.isspace():
-            last_comma = -1
-
-        out.append(ch)
-        i += 1
-
-    return "".join(out)
-
-
-def load_json(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        raise FileNotFoundError(f"Файл не найден: {path}")
-    data = json.loads(strip_jsonc(path.read_text(encoding="utf-8")))
-    if not isinstance(data, dict):
-        raise ValueError(f"Ожидался JSON-объект в верхнем уровне {path}")
-    return data
-
-
-@dataclass(frozen=True)
-class Provider:
-    """Провайдер LLM, собранный из конфигов opencode."""
-
-    id: str
-    name: str
-    base_url: str
-    api_key: str
-    models: list[str]
-
-
-def available_providers() -> list[str]:
-    """Провайдеры, которые известны хотя бы одному из конфигов."""
-    names: set[str] = set()
-
-    if AUTH_FILE.exists():
-        try:
-            names |= set(load_json(AUTH_FILE))
-        except json.JSONDecodeError:
-            pass
-
-    if CONFIG_FILE.exists():
-        try:
-            names |= set(load_json(CONFIG_FILE).get("providers", {}))
-        except json.JSONDecodeError:
-            pass
-
-    return sorted(names)
-
-
-def load_provider(provider_id: str) -> Provider:
-    """Читает ключ из auth.json, baseURL и модели — из opencode.jsonc."""
-    try:
-        auth = load_json(AUTH_FILE)
-    except FileNotFoundError as e:
-        raise SystemExit(
-            f"Ошибка: {e}\n"
-            f"Ожидаемый путь: {AUTH_FILE}\n"
-            "Войдите в opencode командой `/login`, чтобы он создал файл."
-        ) from e
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"Не удалось разобрать {AUTH_FILE}: {e}") from e
-
-    try:
-        config = load_json(CONFIG_FILE)
-    except FileNotFoundError as e:
-        raise SystemExit(f"Ошибка: {e}\nОжидаемый путь: {CONFIG_FILE}") from e
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"Не удалось разобрать {CONFIG_FILE}: {e}") from e
-
-    provider_cfg = config.get("providers", {}).get(provider_id)
-    if provider_cfg is None:
-        known = ", ".join(available_providers()) or "(пусто)"
-        raise SystemExit(
-            f"Провайдер {provider_id!r} не найден в {CONFIG_FILE} (секция providers).\n"
-            f"Доступные провайдеры: {known}"
-        )
-
-    base_url = provider_cfg.get("settings", {}).get("baseURL")
-    if not base_url:
-        raise SystemExit(
-            f"У провайдера {provider_id!r} в {CONFIG_FILE} нет settings.baseURL"
-        )
-    base_url = base_url.rstrip("/")
-
-    # Ключ лежит в auth.json, но у локального сервера (ollama, учебный
-    # марковский сервер) авторизации нет — там ключ просто не нужен.
-    if provider_id in auth:
-        entry = auth[provider_id]
-        api_key = entry.get("key") if isinstance(entry, dict) else entry
-        if not api_key:
-            raise SystemExit(f"В {AUTH_FILE} у провайдера {provider_id!r} нет поля 'key'")
-    elif is_local(base_url):
-        api_key = ""
-        print(f"[info] {provider_id!r} не найден в {AUTH_FILE}, но {base_url} локальный — идём без ключа")
-    else:
-        known = ", ".join(available_providers()) or "(пусто)"
-        raise SystemExit(
-            f"Провайдер {provider_id!r} не найден в {AUTH_FILE}.\n"
-            f"Доступные провайдеры: {known}\n"
-            f"Добавьте его через `/login` в opencode."
-        )
-
-    return Provider(
-        id=provider_id,
-        name=provider_cfg.get("name", provider_id),
-        base_url=base_url,
-        api_key=api_key,
-        models=list(provider_cfg.get("models", {})),
-    )
-
-
-def is_local(url: str) -> bool:
-    """Локальный сервер — ключ ему не нужен."""
-    return bool(re.search(r"://(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)", url))
-
-
-def mask_key(api_key: str) -> str:
-    """Показывает ключ частично — чтобы не утекать в терминал/логи."""
-    if len(api_key) <= 10:
-        return "*" * len(api_key)
-    return f"{api_key[:6]}…{api_key[-4:]}"
 
 
 # --------------------------------------------------------------------------- #
@@ -400,11 +218,13 @@ class SafeAgent:
         model_name: str,
         max_steps: int = DEFAULT_MAX_STEPS,
         native_tools: bool = True,
+        log: ConversationLog | None = None,
     ) -> None:
         self.provider = provider
         self.model_name = model_name
         self.max_steps = max_steps
         self.native_tools = native_tools
+        self.log = log or ConversationLog(enabled=False)
         self.conversation: list[dict[str, Any]] = []
 
         self.tools = build_tools()
@@ -432,24 +252,39 @@ class SafeAgent:
             payload["tools"] = [tool.schema() for tool in self.tools.values()]
             payload["tool_choice"] = "auto"
 
+        self.log.request(
+            self.model_name,
+            messages=len(self.conversation),
+            tools=len(self.tools) if self.native_tools else 0,
+            extra="native tools" if self.native_tools else "текстовый протокол",
+        )
+
         headers = {"Content-Type": "application/json"}
         if self.provider.api_key:
             headers["Authorization"] = f"Bearer {self.provider.api_key}"
 
+        started = time.monotonic()
         response = requests.post(
             f"{self.provider.base_url}/chat/completions",
             headers=headers,
             json=payload,
             timeout=180,
         )
+        elapsed = time.monotonic() - started
 
         if not response.ok:
-            raise RuntimeError(
-                f"HTTP {response.status_code} от {self.provider.base_url}:\n{response.text[:500]}"
-            )
+            # Тело ответа у 503 часто пустое — тогда причина не в нашем запросе
+            detail = response.text.strip()[:400] or "(тело ответа пустое)"
+            raise RuntimeError(f"HTTP {response.status_code} за {elapsed:.1f}с: {detail}")
 
         message = dict(response.json()["choices"][0]["message"])
         message.setdefault("role", "assistant")
+
+        self.log.response(
+            self.model_name,
+            content=message.get("content") or "",
+            tool_calls=message.get("tool_calls"),
+        )
         return message
 
     # -- разбор намерения модели --------------------------------------------- #
@@ -468,7 +303,7 @@ class SafeAgent:
             try:
                 args = json.loads(arguments)
             except json.JSONDecodeError:
-                print(f"  [warn] не удалось разобрать аргументы: {arguments!r}")
+                self.log.error(f"не удалось разобрать аргументы: {arguments!r}")
                 args = {}
             calls.append(
                 {
@@ -504,8 +339,11 @@ class SafeAgent:
         try:
             return tool.call(**args)
         except TypeError as e:
+            # Модель передала не те аргументы: показываем ей, чего ждали
             return f"Error: wrong arguments for '{name}': {e}"
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — ловим всё намеренно
+            # Инструмент не должен ронять агента: модель получит текст ошибки
+            # и сможет либо поправиться, либо ответить пользователю
             return f"Error: '{name}' failed: {e}"
 
     # -- цикл агента -------------------------------------------------------- #
@@ -518,9 +356,10 @@ class SafeAgent:
         одиночная проверка. Останавливаемся, когда модель ответила без
         вызова инструмента, либо упёрлись в max_steps.
         """
+        self.log.user(user_message)
         self.conversation.append({"role": "user", "content": user_message})
 
-        for _ in range(self.max_steps):
+        for step in range(1, self.max_steps + 1):
             message = self.complete()
             self.conversation.append(message)
 
@@ -529,8 +368,10 @@ class SafeAgent:
                 return message.get("content") or "(модель не вернула текст)"
 
             for call in calls:
+                self.log.tool_call(call["name"], json.dumps(call["args"], ensure_ascii=False))
+
                 result = self.run_tool(call["name"], call["args"])
-                print(f"  [tool] {call['name']}({format_args(call['args'])}) -> {result}")
+                self.log.tool_result(result)
 
                 if call["id"] is not None:
                     # Нативный вызов: ответ должен идти в поле role=tool
@@ -550,7 +391,13 @@ class SafeAgent:
                         }
                     )
 
-        return f"(достигнут лимит шагов: {self.max_steps})"
+            # Если остались шаги — покажем, что диалог продолжается
+            if step < self.max_steps:
+                self.log.note(f"шаг {step}/{self.max_steps}, возвращаю результат модели")
+
+        limit_message = f"(достигнут лимит шагов: {self.max_steps})"
+        self.log.note(limit_message)
+        return limit_message
 
     # -- REPL ---------------------------------------------------------------- #
 
@@ -566,6 +413,8 @@ class SafeAgent:
         print(f"  API key : {key_info}")
         print(f"  protocol: {protocol}")
         print(f"  tools   : {', '.join(self.tools)}")
+        if self.log.enabled:
+            print("  лог     : вкл (--log), обмен с моделью печатается с префиксами")
         print("Type 'quit' to exit.\n")
 
         while True:
@@ -579,9 +428,13 @@ class SafeAgent:
                 break
 
             try:
-                print(f"Agent: {self.chat(user_input)}")
-            except Exception as e:
-                print(f"[error] {e}")
+                answer = self.chat(user_input)
+                print(f"\nAgent: {answer}\n")
+            except Exception as e:  # noqa: BLE001 — REPL не должен падать
+                # Ошибка сети или API: показываем её, но продолжаем диалог,
+                # чтобы студент мог увидеть агента целиком, а не traceback
+                self.log.error(str(e))
+                print(f"[ошибка] {e}\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -614,6 +467,11 @@ def main() -> None:
         help="не отправлять tools в API: общаться только текстовым JSON-протоколом",
     )
     parser.add_argument(
+        "--log",
+        action="store_true",
+        help="печатать весь обмен с моделью с префиксами (→ model, ← model, ⚡ tool …)",
+    )
+    parser.add_argument(
         "--list-providers",
         action="store_true",
         help="показать провайдеров, найденных в конфигах opencode",
@@ -631,7 +489,7 @@ def main() -> None:
     if not model_name:
         if not provider.models:
             raise SystemExit(
-                f"У провайдера {provider.id!r} нет моделей в {CONFIG_FILE}. "
+                f"У провайдера {provider.id!r} нет моделей в конфиге. "
                 "Укажите модель явно: --model <id>"
             )
         model_name = provider.models[0]
@@ -646,6 +504,7 @@ def main() -> None:
         model_name=model_name,
         max_steps=args.max_steps,
         native_tools=not args.no_native_tools,
+        log=ConversationLog(enabled=args.log),
     ).run()
 
 
