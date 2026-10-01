@@ -1,36 +1,71 @@
+"""
+Инструменты агента — три независимых класса.
+
+Агент (simple_ai_agent.py) занимается только диалогом с моделью,
+а всё "умение" живёт здесь. Каждый инструмент — обычный класс Python;
+агент вызывает его методы и показывает модели результат.
+
+Два принципа, на которых держится эта архитектура:
+
+  1. Инструменты изолированы. Калькулятор ничего не знает о файлах,
+     поиск по документации — о калькуляторе. Каждый класс можно
+     заменить или выкинуть, не трогая остальные.
+  2. Инструмент возвращает строку (str) — ровно то, что увидит модель.
+     Поэтому ошибки ловятся и превращаются в текст ("Error: ..."),
+     а не в исключения: так модель может прочитать ошибку и поправиться.
+"""
+
 import math
 import re
 
+
 class SafeCalculator:
-    def calculate(self, expression):
-        """Вычисляет математическое выражение безопасно"""
-        # Разрешаем только безопасные символы
-        allowed_pattern = r'^[\d\s\+\-\*\/\(\)\.\,\%\^]+$'
-        if not re.match(allowed_pattern, expression):
+    """Калькулятор: арифметика и факториал."""
+
+    # Белый список символов: только цифры и арифметические операторы.
+    # Знак "_" сюда не входит — поэтому добраться до __class__ или
+    # __import__ через eval нельзя. Вместе с пустым __builtins__
+    # в evaluate() это делает вычисления безопасными (для демки — более чем).
+    ALLOWED = re.compile(r"^[\d\s\+\-\*\/\(\)\.\,\%\^]+$")
+
+    def calculate(self, expression: str) -> str:
+        """Вычисляет арифметическое выражение, например "2 + 2" или "10 * 5"."""
+        if not self.ALLOWED.match(expression):
             return "Error: Invalid expression"
 
         try:
-            # Заменяем ^ на ** для возведения в степень
-            expression = expression.replace('^', '**')
+            # "^" в математике — это степень, а в Python — XOR.
+            expression = expression.replace("^", "**")
+            # Пустой __builtins__ означает, что в области видимости нет
+            # ни одной встроенной функции — вызвать их нельзя.
             result = eval(expression, {"__builtins__": {}}, {})
             return str(result)
-        except:
+        except Exception:
+            # Сюда попадают ZeroDivisionError, NameError и т.п.
+            # Ловим Exception, а не голый except: тот заодно перехватывает
+            # Ctrl-C, а это не ошибка калькулятора.
             return "Error: Calculation failed"
 
-    def factorial(self, n):
-        """Вычисляет факториал"""
+    def factorial(self, n: int | str) -> str:
+        """Факториал целого числа. Принимает и int, и строку из JSON."""
         try:
             n = int(n)
             if n < 0 or n > 20:  # Ограничение для безопасности
                 return "Error: Number must be between 0 and 20"
             return str(math.factorial(n))
-        except:
+        except (TypeError, ValueError):
             return "Error: Invalid input"
 
+
 class VirtualFileSystem:
-    def __init__(self):
-        # Предзаданные файлы с содержимым
-        self.files = {
+    """Виртуальная файловая система: несколько файлов "в памяти".
+
+    Настоящих файлов на диске нет — всё лежит в словаре files.
+    Так агент ничего не ломает в реальной системе.
+    """
+
+    def __init__(self) -> None:
+        self.files: dict[str, str] = {
             "README.md": "# My Project\nThis is a demo project.\nAuthor: Student",
             "main.py": "def hello():\n    print('Hello, world!')\n\nif __name__ == '__main__':\n    hello()",
             "config.json": '{"debug": true, "port": 8080, "version": "1.0.0"}',
@@ -38,51 +73,26 @@ class VirtualFileSystem:
             "requirements.txt": "flask==2.3.0\nrequests==2.31.0\nnumpy==1.24.0",
         }
 
-    def list_files(self):
-        """Возвращает список файлов"""
+    def list_files(self) -> str:
+        """Возвращает имена файлов, каждый на новой строке."""
         return "\n".join(sorted(self.files.keys()))
 
-    def read_file(self, filename):
-        """Читает файл"""
+    def read_file(self, filename: str) -> str:
+        """Возвращает содержимое файла или сообщение об ошибке."""
         if filename in self.files:
             return self.files[filename]
-        else:
-            return f"Error: File '{filename}' not found"
+        return f"Error: File '{filename}' not found"
 
-    def file_exists(self, filename):
-        """Проверяет существование файла"""
+    def file_exists(self, filename: str) -> bool:
+        """Есть ли такой файл (True / False)."""
         return filename in self.files
 
-class SafeCalculator:
-    def calculate(self, expression):
-        """Вычисляет математическое выражение безопасно"""
-        # Разрешаем только безопасные символы
-        allowed_pattern = r'^[\d\s\+\-\*\/\(\)\.\,\%\^]+$'
-        if not re.match(allowed_pattern, expression):
-            return "Error: Invalid expression"
-
-        try:
-            # Заменяем ^ на ** для возведения в степень
-            expression = expression.replace('^', '**')
-            result = eval(expression, {"__builtins__": {}}, {})
-            return str(result)
-        except:
-            return "Error: Calculation failed"
-
-    def factorial(self, n):
-        """Вычисляет факториал"""
-        try:
-            n = int(n)
-            if n < 0 or n > 20:  # Ограничение для безопасности
-                return "Error: Number must be between 0 and 20"
-            return str(math.factorial(n))
-        except:
-            return "Error: Invalid input"
 
 class DocumentationSearch:
-    def __init__(self):
-        # Захардкоженная "документация"
-        self.docs = {
+    """Поиск по маленькому захардкоженному справочнику Python."""
+
+    def __init__(self) -> None:
+        self.docs: dict[str, str] = {
             "print": "print(*objects, sep=' ', end='\\n', file=sys.stdout, flush=False)\n\nPrints the values to a stream, or to sys.stdout by default.",
             "len": "len(obj)\n\nReturn the number of items in a container.",
             "range": "range(stop)\nrange(start, stop[, step])\n\nReturn an immutable sequence type.",
@@ -95,21 +105,21 @@ class DocumentationSearch:
             "zip": "zip(*iterables)\n\nIterate over several iterables in parallel.",
         }
 
-    def search(self, query):
-        """Ищет по документации"""
+    def search(self, query: str) -> str:
+        """Ищет по справочнику. Сначала точное совпадение, потом по подстроке."""
         query = query.lower().strip()
 
-        # Прямое совпадение
+        # Точное совпадение — самый частый и самый точный случай.
         if query in self.docs:
             return f"Documentation for '{query}':\n{self.docs[query]}"
 
-        # Поиск по подстроке
-        results = []
+        # Иначе ищем по подстроке: в ключе или прямо в тексте.
+        results: list[str] = []
         for key, doc in self.docs.items():
             if query in key or query in doc.lower():
-                results.append(f"- {key}: {doc.split(chr(10))[0]}")
+                first_line = doc.split("\n")[0]
+                results.append(f"- {key}: {first_line}")
 
         if results:
             return f"Found {len(results)} results:\n" + "\n".join(results[:5])
-        else:
-            return f"No documentation found for '{query}'"
+        return f"No documentation found for '{query}'"

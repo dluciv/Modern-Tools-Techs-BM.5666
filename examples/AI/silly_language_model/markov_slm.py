@@ -6,14 +6,15 @@
 # ]
 # ///
 """
-Silly Language Model
+Silly Language Model — с поддержкой стриминга и заготовками для агентов
 """
 
 from glob import glob
 import random
 import re
+import json as json_module
 from collections import defaultdict, Counter
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import time
 import uuid
 
@@ -23,19 +24,28 @@ class ImprovedMarkovChain:
     def __init__(self, training_texts, order=4):
         self.order = order
         self.chain = defaultdict(list)
-        self.start_states = []  # Состояния, с которых могут начинаться предложения
+        self.start_states = []
         self.word_frequencies = Counter()
 
-        # Обучаемся на корпусе
+        # Заготовки ответов для типовых запросов агентов (tool-calling, MCP и т.п.)
+        # Агенты часто отправляют длинные системные промпты с упоминанием этих слов
+        self.agent_responses = {
+            "list files": "Here are the files in the current directory: README.md, main.py, config.json, data.txt, requirements.txt",
+            "list_files": "Here are the files in the current directory: README.md, main.py, config.json, data.txt, requirements.txt",
+            "read file": "File contents: # My Project\nThis is a demo project.\nAuthor: Student",
+            "read_file": "File contents: # My Project\nThis is a demo project.\nAuthor: Student",
+            "calculate": "The result is: 42",
+            "search": "Found 3 results matching your query",
+            "tool": "I'm sorry, I cannot use tools yet. My brain is still training.",
+            "mcp": "Model Context Protocol is a standard for connecting AI models to tools.",
+        }
+
         for text in training_texts:
             self.train_text(text)
 
     def tokenize(self, text):
         """Улучшенная токенизация для русского языка"""
-        # Сохраняем пунктуацию как отдельные токены
-        # Добавляем пробелы вокруг пунктуации для разделения
         text = re.sub(r'([,.!?;:])', r' \1 ', text)
-        # Токенизируем слова и пунктуацию
         tokens = re.findall(r'\b\w+\b|[^\w\s]', text.lower())
         return tokens
 
@@ -49,23 +59,26 @@ class ImprovedMarkovChain:
             next_token = tokens[i + self.order]
             self.chain[state].append(next_token)
 
-            # Запоминаем стартовые состояния (начало предложений)
             if i == 0 or tokens[i-1] in '.!?':
                 self.start_states.append(state)
 
     def generate(self, prompt, max_tokens=50):
         """Генерация продолжения промпта"""
+        # Сначала проверяем заготовки для агентов
+        prompt_lower = prompt.lower()
+        for key, response in self.agent_responses.items():
+            if key in prompt_lower:
+                return response
+
         tokens = self.tokenize(prompt)
 
-        # Если промпт слишком короткий, начинаем с случайного стартового состояния
         if len(tokens) < self.order:
             if self.start_states:
                 state = random.choice(self.start_states)
                 tokens = list(state)
             else:
-                return ""
+                return "I'm not sure how to respond to that."
         else:
-            # Берем последние `order` токенов как состояние
             state = tuple(tokens[-self.order:])
 
         generated = []
@@ -73,32 +86,28 @@ class ImprovedMarkovChain:
 
         for _ in range(max_tokens):
             if current_state not in self.chain:
-                # Нет продолжения — пробуем найти похожее состояние
                 possible_states = self.find_similar_states(current_state)
                 if not possible_states:
                     break
                 current_state = random.choice(possible_states)
 
-            # Взвешенный выбор следующего токена
             next_token = self.weighted_choice(self.chain[current_state])
             generated.append(next_token)
 
-            # Останавливаемся на конце предложения
             if next_token in '.!?':
                 break
 
-            # Сдвигаем окно
             current_state = current_state[1:] + (next_token,)
 
-        return self.detokenize(generated)
+        result = self.detokenize(generated)
+        return result if result else "I don't have enough information to answer that."
 
     def find_similar_states(self, state):
         """Находим состояния, похожие на данное"""
         similar = []
         for s in self.chain.keys():
-            # Считаем количество совпадающих токенов
             matches = sum(1 for a, b in zip(s, state) if a == b)
-            if matches >= self.order - 1:  # Почти полное совпадение
+            if matches >= self.order - 1:
                 similar.append(s)
         return similar
 
@@ -107,10 +116,8 @@ class ImprovedMarkovChain:
         if not tokens:
             return ""
 
-        # Подсчитываем частоту каждого токена
         token_counts = Counter(tokens)
 
-        # Создаем взвешенный список
         weighted_tokens = []
         weights = []
         for token, count in token_counts.items():
@@ -131,7 +138,6 @@ class ImprovedMarkovChain:
             else:
                 result += ' ' + token
 
-        # Заглавная буква в начале
         if result and result[0].isalpha():
             result = result[0].upper() + result[1:]
 
@@ -141,12 +147,10 @@ class ImprovedMarkovChain:
         """Пытаемся ответить на вопрос, используя корпус"""
         question_tokens = self.tokenize(question)
 
-        # Ищем состояния, содержащие слова из вопроса
         best_match = None
         best_score = 0
 
         for state in self.chain.keys():
-            # Считаем пересечение слов
             state_words = set(state)
             question_words = set(question_tokens)
             overlap = len(state_words & question_words)
@@ -156,10 +160,8 @@ class ImprovedMarkovChain:
                 best_match = state
 
         if best_match and best_score >= 1:
-            # Генерируем продолжение из найденного состояния
             return self.generate_from_state(best_match, max_tokens=20)
 
-        # Если не нашли ответ, генерируем случайное предложение
         return self.generate("", max_tokens=15)
 
     def generate_from_state(self, state, max_tokens=20):
@@ -224,7 +226,7 @@ training_data = [
     "Пока! Не забывай заходить в гости.",
 ]
 
-paths = glob("markov*.txt")  # your pattern here
+paths = glob("markov*.txt")
 
 for path in paths:
     with open(path, "r", encoding="utf-8") as f:
@@ -232,15 +234,57 @@ for path in paths:
 
 model = ImprovedMarkovChain(training_data, order=4)
 
+
+def generate_streaming_response(request_id, created_time, model_name, content):
+    """Генератор для стримингового ответа в формате SSE (Server-Sent Events)"""
+    # Разбиваем на слова — так стриминг выглядит естественнее
+    words = content.split()
+
+    for i, word in enumerate(words):
+        token = word if i == 0 else " " + word
+
+        chunk = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": token},
+                "finish_reason": None
+            }]
+        }
+
+        yield f"data: {json_module.dumps(chunk, ensure_ascii=False)}\n\n"
+        time.sleep(0.03)  # имитация "раздумий" модели
+
+    # Финальный чанк с finish_reason — это критично для агентов!
+    final_chunk = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": created_time,
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }]
+    }
+
+    yield f"data: {json_module.dumps(final_chunk, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():
     data = request.json
 
     messages = data.get('messages', [])
+    stream = data.get('stream', False)  # Поддержка стриминга
     user_message = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), '')
     max_tokens = data.get('max_tokens', 100)
 
-    # Простая диалоговая логика
+    # Простая диалоговая логика (сохраняем вашу)
     user_lower = user_message.lower()
 
     if any(word in user_lower for word in ['привет', 'здравствуй', 'добрый', 'хай']):
@@ -252,25 +296,43 @@ def chat_completions():
     else:
         response_text = model.generate(user_message, max_tokens=max_tokens)
 
+    request_id = f"chatcmpl-{uuid.uuid4()}"
+    created_time = int(time.time())
+    model_name = "markov-chain-v1"
+
+    # Стриминговый ответ
+    if stream:
+        return Response(
+            generate_streaming_response(request_id, created_time, model_name, response_text),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no'  # для nginx
+            }
+        )
+
+    # Обычный ответ
     return jsonify({
-        "id": f"chatcmpl-{uuid.uuid4()}",
+        "id": request_id,
         "object": "chat.completion",
-        "created": int(time.time()),
-        "model": "markov-chain-v1",
+        "created": created_time,
+        "model": model_name,
         "choices": [{
             "index": 0,
             "message": {
                 "role": "assistant",
                 "content": response_text
             },
-            "finish_reason": "length"
+            "finish_reason": "stop"  # было "length" — это ломает агентов
         }],
         "usage": {
-            "prompt_tokens": len(user_message.split()),
+            "prompt_tokens": len(user_message.split()) if user_message else 0,
             "completion_tokens": len(response_text.split()),
-            "total_tokens": len(user_message.split()) + len(response_text.split())
+            "total_tokens": (len(user_message.split()) if user_message else 0) + len(response_text.split())
         }
     })
+
 
 @app.route('/v1/models', methods=['GET'])
 def list_models():
@@ -283,6 +345,7 @@ def list_models():
             "owned_by": "student-demo"
         }]
     })
+
 
 if __name__ == '__main__':
     app.run(port=8000, debug=True)
