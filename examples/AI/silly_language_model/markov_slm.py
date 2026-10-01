@@ -25,7 +25,6 @@ class ImprovedMarkovChain:
         self.order = order
         self.chain = defaultdict(list)
         self.start_states = []
-        self.word_frequencies = Counter()
 
         # Заготовки ответов для типовых запросов агентов (tool-calling, MCP и т.п.)
         # Агенты часто отправляют длинные системные промпты с упоминанием этих слов
@@ -52,7 +51,6 @@ class ImprovedMarkovChain:
     def train_text(self, text):
         """Обучение на одном тексте"""
         tokens = self.tokenize(text)
-        self.word_frequencies.update(tokens)
 
         for i in range(len(tokens) - self.order):
             state = tuple(tokens[i:i+self.order])
@@ -146,14 +144,15 @@ class ImprovedMarkovChain:
     def answer_question(self, question):
         """Пытаемся ответить на вопрос, используя корпус"""
         question_tokens = self.tokenize(question)
+        # Множество считаем один раз, а не внутри цикла: иначе на каждом
+        # из ~11 тысяч состояний пересобираем его заново
+        question_words = set(question_tokens)
 
         best_match = None
         best_score = 0
 
         for state in self.chain.keys():
-            state_words = set(state)
-            question_words = set(question_tokens)
-            overlap = len(state_words & question_words)
+            overlap = len(set(state) & question_words)
 
             if overlap > best_score:
                 best_score = overlap
@@ -235,40 +234,43 @@ for path in paths:
 model = ImprovedMarkovChain(training_data, order=4)
 
 
-def generate_streaming_response(request_id, created_time, model_name, content):
+def generate_streaming_response(request_id, created_time, model_name, content,
+                                prompt_tokens=0, completion_tokens=0):
     """Генератор для стримингового ответа в формате SSE (Server-Sent Events)"""
-    # Разбиваем на слова — так стриминг выглядит естественнее
-    words = content.split()
-
-    for i, word in enumerate(words):
-        token = word if i == 0 else " " + word
-
-        chunk = {
+    # Первый чанк по спецификации OpenAI несёт только роль,
+    # без символов ответа — так клиент знает, что начался поток
+    def chunk(delta, finish_reason=None):
+        return {
             "id": request_id,
             "object": "chat.completion.chunk",
             "created": created_time,
             "model": model_name,
             "choices": [{
                 "index": 0,
-                "delta": {"content": token},
-                "finish_reason": None
+                "delta": delta,
+                "finish_reason": finish_reason
             }]
         }
 
-        yield f"data: {json_module.dumps(chunk, ensure_ascii=False)}\n\n"
+    yield f"data: {json_module.dumps(chunk({'role': 'assistant', 'content': ''}), ensure_ascii=False)}\n\n"
+
+    # Разбиваем на слова — так стриминг выглядит естественнее
+    words = content.split()
+
+    for i, word in enumerate(words):
+        token = word if i == 0 else " " + word
+
+        yield f"data: {json_module.dumps(chunk({'content': token}), ensure_ascii=False)}\n\n"
         time.sleep(0.03)  # имитация "раздумий" модели
 
     # Финальный чанк с finish_reason — это критично для агентов!
-    final_chunk = {
-        "id": request_id,
-        "object": "chat.completion.chunk",
-        "created": created_time,
-        "model": model_name,
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": "stop"
-        }]
+    final_chunk = chunk({}, "stop")
+    # usage по спеке приходит в последнем чанке потока, иначе клиент
+    # (в том числе OpenCode) показывает нули вместо расхода токенов
+    final_chunk["usage"] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
     }
 
     yield f"data: {json_module.dumps(final_chunk, ensure_ascii=False)}\n\n"
@@ -277,12 +279,41 @@ def generate_streaming_response(request_id, created_time, model_name, content):
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():
-    data = request.json
+    # request.json падает с 400, если тело битое или пустое, и Flask
+    # отдаёт HTML-страницу. Клиент OpenAI ждёт JSON с полем error,
+    # поэтому аккуратно ловим оба случая.
+    try:
+        data = request.get_json(force=False, silent=True)
+    except Exception:
+        data = None
 
-    messages = data.get('messages', [])
+    if not isinstance(data, dict):
+        return jsonify({
+            "error": {
+                "message": "Expected a JSON object in the request body",
+                "type": "invalid_request_error",
+                "code": None,
+            }
+        }), 400
+
+    messages = data.get('messages') or []
+    if not isinstance(messages, list):
+        return jsonify({
+            "error": {
+                "message": "'messages' must be a list",
+                "type": "invalid_request_error",
+                "code": None,
+            }
+        }), 400
+
     stream = data.get('stream', False)  # Поддержка стриминга
     user_message = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), '')
-    max_tokens = data.get('max_tokens', 100)
+    max_tokens = data.get('max_tokens') or 100
+    # Приводим к целому: клиент может прислать строку, а range() её не берёт
+    try:
+        max_tokens = max(1, int(max_tokens))
+    except (TypeError, ValueError):
+        max_tokens = 100
 
     # Простая диалоговая логика (сохраняем вашу)
     user_lower = user_message.lower()
@@ -300,10 +331,17 @@ def chat_completions():
     created_time = int(time.time())
     model_name = "markov-chain-v1"
 
+    # Считаем токены так же, как в обычном ответе, — иначе в потоке
+    # расход будет нулевым
+    prompt_tokens = sum(len(m['content'].split()) for m in messages
+                       if isinstance(m.get('content'), str))
+    completion_tokens = len(response_text.split())
+
     # Стриминговый ответ
     if stream:
         return Response(
-            generate_streaming_response(request_id, created_time, model_name, response_text),
+            generate_streaming_response(request_id, created_time, model_name, response_text,
+                                        prompt_tokens, completion_tokens),
             mimetype='text/event-stream',
             headers={
                 'Cache-Control': 'no-cache',
@@ -348,4 +386,7 @@ def list_models():
 
 
 if __name__ == '__main__':
-    app.run(port=8000, debug=True)
+    # debug=True поднимает интерактивный отладчик, доступный любому,
+    # кто дотянулся до порта. Для локальной демки это лишний риск:
+    # включайте только на своей машине и только на время отладки.
+    app.run(port=8000, debug=False)
