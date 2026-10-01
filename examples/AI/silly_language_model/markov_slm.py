@@ -1,0 +1,288 @@
+#!/usr/bin/env -S uv run --quiet --script --
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#     "flask>=3.1.3",
+# ]
+# ///
+"""
+Silly Language Model
+"""
+
+from glob import glob
+import random
+import re
+from collections import defaultdict, Counter
+from flask import Flask, request, jsonify
+import time
+import uuid
+
+app = Flask(__name__)
+
+class ImprovedMarkovChain:
+    def __init__(self, training_texts, order=4):
+        self.order = order
+        self.chain = defaultdict(list)
+        self.start_states = []  # Состояния, с которых могут начинаться предложения
+        self.word_frequencies = Counter()
+
+        # Обучаемся на корпусе
+        for text in training_texts:
+            self.train_text(text)
+
+    def tokenize(self, text):
+        """Улучшенная токенизация для русского языка"""
+        # Сохраняем пунктуацию как отдельные токены
+        # Добавляем пробелы вокруг пунктуации для разделения
+        text = re.sub(r'([,.!?;:])', r' \1 ', text)
+        # Токенизируем слова и пунктуацию
+        tokens = re.findall(r'\b\w+\b|[^\w\s]', text.lower())
+        return tokens
+
+    def train_text(self, text):
+        """Обучение на одном тексте"""
+        tokens = self.tokenize(text)
+        self.word_frequencies.update(tokens)
+
+        for i in range(len(tokens) - self.order):
+            state = tuple(tokens[i:i+self.order])
+            next_token = tokens[i + self.order]
+            self.chain[state].append(next_token)
+
+            # Запоминаем стартовые состояния (начало предложений)
+            if i == 0 or tokens[i-1] in '.!?':
+                self.start_states.append(state)
+
+    def generate(self, prompt, max_tokens=50):
+        """Генерация продолжения промпта"""
+        tokens = self.tokenize(prompt)
+
+        # Если промпт слишком короткий, начинаем с случайного стартового состояния
+        if len(tokens) < self.order:
+            if self.start_states:
+                state = random.choice(self.start_states)
+                tokens = list(state)
+            else:
+                return ""
+        else:
+            # Берем последние `order` токенов как состояние
+            state = tuple(tokens[-self.order:])
+
+        generated = []
+        current_state = state
+
+        for _ in range(max_tokens):
+            if current_state not in self.chain:
+                # Нет продолжения — пробуем найти похожее состояние
+                possible_states = self.find_similar_states(current_state)
+                if not possible_states:
+                    break
+                current_state = random.choice(possible_states)
+
+            # Взвешенный выбор следующего токена
+            next_token = self.weighted_choice(self.chain[current_state])
+            generated.append(next_token)
+
+            # Останавливаемся на конце предложения
+            if next_token in '.!?':
+                break
+
+            # Сдвигаем окно
+            current_state = current_state[1:] + (next_token,)
+
+        return self.detokenize(generated)
+
+    def find_similar_states(self, state):
+        """Находим состояния, похожие на данное"""
+        similar = []
+        for s in self.chain.keys():
+            # Считаем количество совпадающих токенов
+            matches = sum(1 for a, b in zip(s, state) if a == b)
+            if matches >= self.order - 1:  # Почти полное совпадение
+                similar.append(s)
+        return similar
+
+    def weighted_choice(self, tokens):
+        """Взвешенный выбор токена (частые токены выбираются чаще)"""
+        if not tokens:
+            return ""
+
+        # Подсчитываем частоту каждого токена
+        token_counts = Counter(tokens)
+
+        # Создаем взвешенный список
+        weighted_tokens = []
+        weights = []
+        for token, count in token_counts.items():
+            weighted_tokens.append(token)
+            weights.append(count)
+
+        return random.choices(weighted_tokens, weights=weights)[0]
+
+    def detokenize(self, tokens):
+        """Собираем токены обратно в текст"""
+        if not tokens:
+            return ""
+
+        result = tokens[0]
+        for token in tokens[1:]:
+            if token in '.,!?;:':
+                result += token
+            else:
+                result += ' ' + token
+
+        # Заглавная буква в начале
+        if result and result[0].isalpha():
+            result = result[0].upper() + result[1:]
+
+        return result
+
+    def answer_question(self, question):
+        """Пытаемся ответить на вопрос, используя корпус"""
+        question_tokens = self.tokenize(question)
+
+        # Ищем состояния, содержащие слова из вопроса
+        best_match = None
+        best_score = 0
+
+        for state in self.chain.keys():
+            # Считаем пересечение слов
+            state_words = set(state)
+            question_words = set(question_tokens)
+            overlap = len(state_words & question_words)
+
+            if overlap > best_score:
+                best_score = overlap
+                best_match = state
+
+        if best_match and best_score >= 1:
+            # Генерируем продолжение из найденного состояния
+            return self.generate_from_state(best_match, max_tokens=20)
+
+        # Если не нашли ответ, генерируем случайное предложение
+        return self.generate("", max_tokens=15)
+
+    def generate_from_state(self, state, max_tokens=20):
+        """Генерация из конкретного состояния"""
+        generated = []
+        current_state = state
+
+        for _ in range(max_tokens):
+            if current_state not in self.chain:
+                break
+
+            next_token = self.weighted_choice(self.chain[current_state])
+            generated.append(next_token)
+
+            if next_token in '.!?':
+                break
+
+            current_state = current_state[1:] + (next_token,)
+
+        return self.detokenize(generated)
+
+# Обучающий корпус на русском
+training_data = [
+    "Привет! Как дела? Я рада тебя видеть.",
+    "Здравствуй, дорогой друг! Как настроение сегодня?",
+    "Добрый день! Чем могу помочь?",
+    "Привет! Рад тебя видеть. Как прошла неделя?",
+
+    "Искусственный интеллект — это область информатики, которая занимается созданием умных машин.",
+    "Машинное обучение позволяет компьютерам учиться на данных без явного программирования.",
+    "Нейронные сети имитируют работу человеческого мозга для решения сложных задач.",
+    "Большие языковые модели способны генерировать текст, похожий на человеческий.",
+
+    "Программирование — это процесс создания компьютерных программ.",
+    "Хороший код должен быть читаемым, эффективным и надежным.",
+    "Тестирование помогает находить ошибки в программах до их выпуска.",
+    "Версионирование кода позволяет отслеживать изменения и работать в команде.",
+
+    "Жизнь прекрасна и удивительна! Каждый день приносит что-то новое.",
+    "Учиться никогда не поздно. Знания открывают новые возможности.",
+    "Чтение книг расширяет кругозор и развивает мышление.",
+    "Музыка способна поднять настроение и вдохновить на новые свершения.",
+
+    "Погода сегодня отличная! Солнце светит, птицы поют.",
+    "Лето — прекрасное время для отдыха и путешествий.",
+    "Осень приносит яркие краски и прохладу.",
+    "Зима — время снега, лыж и горячего чая.",
+
+    "Технологии развиваются очень быстро. То, что казалось фантастикой вчера, сегодня становится реальностью.",
+    "Интернет изменил способы общения и получения информации.",
+    "Смартфоны стали неотъемлемой частью нашей жизни.",
+    "Робототехника открывает новые возможности для автоматизации.",
+
+    "Наука помогает нам понимать мир вокруг нас.",
+    "Физика изучает законы природы и свойства материи.",
+    "Математика — язык, на котором написана вселенная.",
+    "Биология раскрывает тайны живых организмов.",
+
+    "Спасибо за интересный разговор! Было приятно пообщаться.",
+    "До свидания! Удачи тебе во всех начинаниях.",
+    "Хорошего дня! Пусть все получится.",
+    "Пока! Не забывай заходить в гости.",
+]
+
+paths = glob("markov*.txt")  # your pattern here
+
+for path in paths:
+    with open(path, "r", encoding="utf-8") as f:
+        training_data.append(f.read())
+
+model = ImprovedMarkovChain(training_data, order=4)
+
+@app.route('/v1/chat/completions', methods=['POST'])
+def chat_completions():
+    data = request.json
+
+    messages = data.get('messages', [])
+    user_message = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), '')
+    max_tokens = data.get('max_tokens', 100)
+
+    # Простая диалоговая логика
+    user_lower = user_message.lower()
+
+    if any(word in user_lower for word in ['привет', 'здравствуй', 'добрый', 'хай']):
+        response_text = model.generate("Привет! Как дела?", max_tokens=max_tokens)
+    elif '?' in user_message:
+        response_text = model.answer_question(user_message)
+    elif any(word in user_lower for word in ['пока', 'до свидания', 'прощай']):
+        response_text = model.generate("До свидания! Удачи тебе.", max_tokens=max_tokens)
+    else:
+        response_text = model.generate(user_message, max_tokens=max_tokens)
+
+    return jsonify({
+        "id": f"chatcmpl-{uuid.uuid4()}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "markov-chain-v1",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": response_text
+            },
+            "finish_reason": "length"
+        }],
+        "usage": {
+            "prompt_tokens": len(user_message.split()),
+            "completion_tokens": len(response_text.split()),
+            "total_tokens": len(user_message.split()) + len(response_text.split())
+        }
+    })
+
+@app.route('/v1/models', methods=['GET'])
+def list_models():
+    return jsonify({
+        "object": "list",
+        "data": [{
+            "id": "markov-chain-v1",
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "student-demo"
+        }]
+    })
+
+if __name__ == '__main__':
+    app.run(port=8000, debug=True)
