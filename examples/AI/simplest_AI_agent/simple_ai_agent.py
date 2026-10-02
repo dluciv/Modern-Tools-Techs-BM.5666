@@ -20,15 +20,22 @@ Simple AI agent
     ./simple_ai_agent.py                      # провайдер из OPENCODE_PROVIDER
     ./simple_ai_agent.py routerai-ru
     ./simple_ai_agent.py routerai-ru --model xiaomi/mimo-v2.5
-    ./simple_ai_agent.py --log               # показать обмен с моделью
+    ./simple_ai_agent.py --no-log             # убрать лог совсем
+    ./simple_ai_agent.py --log-file run.log   # писать трассировку в другой файл
     ./simple_ai_agent.py --no-native-tools    # принудительно текстовый протокол
     ./simple_ai_agent.py --list-providers
+
+Журналы включены по умолчанию, как в самом OpenCode:
+  * в терминал печатается пересказ обмена (→ model, ← model, ⚡ tool …);
+  * в agent_trace.log пишется полный протокол — тела запросов и ответов
+    целиком, вместе с заголовками и статусом. История диалога повторяется
+    в каждом запросе: так видно, что агент шлёт модели весь контекст.
 
 Три файла рядом:
     simple_ai_agent.py  — этот файл: цикл агента
     safe_agent_tools.py — сами инструменты (калькулятор, ФС, поиск)
     opencode_config.py  — чтение конфигов opencode (ключи, baseURL)
-    agent_log.py        — журнал общения с моделью (--log)
+    agent_log.py        — журналы: пересказ в терминал и трассировка в файл
 """
 import argparse
 import json
@@ -37,11 +44,12 @@ import re
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import requests
 
-from agent_log import ConversationLog
+from agent_log import ConversationLog, HttpTrace
 from opencode_config import (
     AUTH_FILE,
     Provider,
@@ -53,6 +61,7 @@ from safe_agent_tools import DocumentationSearch, SafeCalculator, VirtualFileSys
 
 DEFAULT_PROVIDER = "routerai-ru"
 DEFAULT_MAX_STEPS = 8
+DEFAULT_LOG_FILE = "agent_trace.log"
 
 
 # --------------------------------------------------------------------------- #
@@ -219,12 +228,14 @@ class SafeAgent:
         max_steps: int = DEFAULT_MAX_STEPS,
         native_tools: bool = True,
         log: ConversationLog | None = None,
+        trace: HttpTrace | None = None,
     ) -> None:
         self.provider = provider
         self.model_name = model_name
         self.max_steps = max_steps
         self.native_tools = native_tools
-        self.log = log or ConversationLog(enabled=False)
+        self.log = log or ConversationLog()
+        self.trace = trace or HttpTrace(path=None)
         self.conversation: list[dict[str, Any]] = []
 
         self.tools = build_tools()
@@ -263,14 +274,23 @@ class SafeAgent:
         if self.provider.api_key:
             headers["Authorization"] = f"Bearer {self.provider.api_key}"
 
+        url = f"{self.provider.base_url}/chat/completions"
+
+        # Трассировку пишем ДО отправки: если запрос упал на сети или по
+        # таймауту, мы всё равно хотим видеть, что именно уходило
+        self.trace.request(url=url, method="POST", headers=headers, payload=payload)
+
         started = time.monotonic()
-        response = requests.post(
-            f"{self.provider.base_url}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=180,
-        )
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=180)
+        except requests.RequestException as exc:
+            self.trace.failure(f"{type(exc).__name__}: {exc}")
+            raise
         elapsed = time.monotonic() - started
+
+        self.trace.response(
+            status=response.status_code, elapsed=elapsed, body=response.text
+        )
 
         if not response.ok:
             # Тело ответа у 503 часто пустое — тогда причина не в нашем запросе
@@ -368,6 +388,10 @@ class SafeAgent:
                 return message.get("content") or "(модель не вернула текст)"
 
             for call in calls:
+                self.trace.event(
+                    f"модель просит инструмент: {call['name']}"
+                    f"({json.dumps(call['args'], ensure_ascii=False)})"
+                )
                 self.log.tool_call(call["name"], json.dumps(call["args"], ensure_ascii=False))
 
                 result = self.run_tool(call["name"], call["args"])
@@ -408,33 +432,51 @@ class SafeAgent:
             if self.provider.api_key
             else "не требуется (локальный сервер)"
         )
+        session_info = [
+            ("провайдер", self.provider.name),
+            ("модель", self.model_name),
+            ("base URL", self.provider.base_url),
+            ("протокол", protocol),
+            ("ключ", key_info),
+            ("лимит шагов", self.max_steps),
+            ("инструменты", ", ".join(self.tools)),
+        ]
+        self.trace.open([f"{label:<12} : {value}" for label, value in session_info])
+
         print(f"Safe Agent started: {self.provider.name} / {self.model_name}")
         print(f"  base URL: {self.provider.base_url}")
         print(f"  API key : {key_info}")
         print(f"  protocol: {protocol}")
         print(f"  tools   : {', '.join(self.tools)}")
-        if self.log.enabled:
-            print("  лог     : вкл (--log), обмен с моделью печатается с префиксами")
+        print(f"  лог     : {'обмен печатается' if self.log.enabled else 'выключен (--no-log)'}")
+        if self.trace.enabled and self.trace.path is not None:
+            print(f"  трассировка: всё, что уходит по HTTP и приходит обратно — {self.trace.path}")
         print("Type 'quit' to exit.\n")
 
-        while True:
-            try:
-                user_input = input("You: ")
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
+        try:
+            while True:
+                try:
+                    user_input = input("You: ")
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
 
-            if user_input.strip().lower() in {"quit", "exit"}:
-                break
+                if user_input.strip().lower() in {"quit", "exit"}:
+                    break
 
-            try:
-                answer = self.chat(user_input)
-                print(f"\nAgent: {answer}\n")
-            except Exception as e:  # noqa: BLE001 — REPL не должен падать
-                # Ошибка сети или API: показываем её, но продолжаем диалог,
-                # чтобы студент мог увидеть агента целиком, а не traceback
-                self.log.error(str(e))
-                print(f"[ошибка] {e}\n")
+                try:
+                    answer = self.chat(user_input)
+                    print(f"\nAgent: {answer}\n")
+                except Exception as e:  # noqa: BLE001 — REPL не должен падать
+                    # Ошибка сети или API: показываем её, но продолжаем диалог,
+                    # чтобы студент мог увидеть агента целиком, а не traceback
+                    self.log.error(str(e))
+                    self.trace.event(f"ошибка: {e}")
+                    print(f"[ошибка] {e}\n")
+        finally:
+            # Закрываем файл даже на Ctrl+C: на диске останется всё,
+            # что успело уйти в сеть
+            self.trace.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -467,9 +509,15 @@ def main() -> None:
         help="не отправлять tools в API: общаться только текстовым JSON-протоколом",
     )
     parser.add_argument(
-        "--log",
+        "--no-log",
         action="store_true",
-        help="печатать весь обмен с моделью с префиксами (→ model, ← model, ⚡ tool …)",
+        help="не печатать обмен с моделью и не писать трассировку в файл (по умолчанию включено)",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=DEFAULT_LOG_FILE,
+        metavar="PATH",
+        help=f"куда писать всё, что уходит по HTTP и возвращается (по умолчанию {DEFAULT_LOG_FILE})",
     )
     parser.add_argument(
         "--list-providers",
@@ -499,12 +547,17 @@ def main() -> None:
             f"(в конфиге: {', '.join(provider.models)}) — пробуем как есть"
         )
 
+    # Логи включаем по умолчанию: разговор с моделью — это и есть работа
+    # агента. --no-log убирает и консольный лог, и файл трассировки.
+    verbose = not args.no_log
+
     SafeAgent(
         provider=provider,
         model_name=model_name,
         max_steps=args.max_steps,
         native_tools=not args.no_native_tools,
-        log=ConversationLog(enabled=args.log),
+        log=ConversationLog(enabled=verbose),
+        trace=HttpTrace(path=Path(args.log_file) if verbose else None),
     ).run()
 
 
