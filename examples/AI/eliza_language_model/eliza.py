@@ -32,6 +32,13 @@
 Ни Flask, ни HTTP здесь нет — только разговор. Сервер в eliza_slm.py
 перекладывает сюда текст запроса и забирает готовую строку ответа.
 
+Модель ещё и объясняет свой выбор: decide() возвращает не только реплику,
+но и пошаговый разбор — какое ключевое слово сработало, что стало хвостом
+фразы, какие варианты ответа были и с какими вероятностями выбран именно
+этот. Сервер показывает этот разбор в своём журнале (eliza_log.py). Ответ
+без объяснения выглядит оракулом, а ответ с объяснением — очевидным
+сложением слов: видно, что Элиза никуда не «знает», а перебирает правила.
+
 Запуск в терминале:  uv run --script eliza.py
 """
 
@@ -205,6 +212,10 @@ MIN_PREFIX_LENGTH = 3
 # «Почему ты ничего не помнишь?» спрашивала про память, а не про «почему».
 KEYWORD_PRIORITY_FLOOR = 6
 
+# Сколько правил пробуем за раз. Больше трёх — уже не Элиза, а лотерея:
+# реплика перестаёт быть ответом по теме.
+MAX_RULES_PER_REPLY = 3
+
 # Вводные слова в начале хвоста. Без их удаления шаблон «Вы полагаете,
 # что *?» получает «Вы полагаете, что что это правда».
 TAIL_FILLERS: frozenset[str] = frozenset({"что", "будто", "как будто", "вроде"})
@@ -250,6 +261,55 @@ class Rule:
     keywords: tuple[str, ...]
     responses: tuple[str, ...]
     priority: int = 0
+
+
+def clip(text: str, limit: int = 60) -> str:
+    """Обрезает текст для журнала: в одну строку помещается не всё."""
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def plural(count: int, one: str, few: str, many: str) -> str:
+    """Согласует существительное с числом: 1 слово, 2 слова, 5 слов.
+
+    Разбор модели читают глазами, и «4 слов» сразу выдаёт, что текст
+    писали на автомате.
+    """
+    if 11 <= count % 100 <= 14:
+        form = many
+    elif count % 10 == 1:
+        form = one
+    elif 2 <= count % 10 <= 4:
+        form = few
+    else:
+        form = many
+    return f"{count} {form}"
+
+
+@dataclass
+class Decision:
+    """Ответ модели вместе с объяснением, как она к нему пришла.
+
+    Серверу нужна строка `reply`, а журналу — остальное: `path` и
+    `reason` попадают в сводку, `steps` идёт построчно и показывает весь
+    ход рассуждения. Объект собирается по ходу работы (note()) и потом
+    только читается.
+
+    Такой объект — самый дешёвый способ не соврать в журнале: строка
+    объяснения пишется в том же месте кода, где принимается решение,
+    поэтому разойтись с ответом они не могут.
+    """
+
+    reply: str = ""
+    temperature: float = DEFAULT_TEMPERATURE
+    path: str = ""  # какая ветка сработала: правило, заготовка агента, запас
+    reason: str = ""  # коротко: «память», «ни одного ключевого слова»
+    limited: bool = False  # ответ обрезан по max_tokens
+    steps: list[str] = field(default_factory=list)
+
+    def note(self, text: str) -> None:
+        """Добавляет строку в объяснение — её увидит журнал сервера."""
+        self.steps.append(text)
 
 
 # Правила выписаны по убыванию приоритета — так их удобнее читать
@@ -727,13 +787,18 @@ def fill(template: str, tail: str) -> str:
     return text
 
 
-def agent_reply_of(message: str) -> str:
-    """Проверяет, не служебный ли это запрос агента."""
+def agent_reply_of(message: str) -> tuple[str, str]:
+    """Проверяет, не служебный ли это запрос агента.
+
+    Возвращает пару (слово, по которому узнали запрос, ответ), а если
+    запрос обычный — ("", ""). Слово нужно журналу: он показывает, какая
+    именно заготовка сработала.
+    """
     lowered = message.lower()
     for key, response in AGENT_RESPONSES.items():
         if key in lowered:
-            return response
-    return ""
+            return key, response
+    return "", ""
 
 
 def truncate(reply: str, max_tokens: int) -> str:
@@ -798,15 +863,21 @@ class Eliza:
         ]
 
     def _candidates(
-        self, words: list[str], is_question: bool
+        self,
+        words: list[str],
+        matches: list[tuple[int, Rule, str]],
+        is_question: bool,
     ) -> list[tuple[float, Rule, str, int]]:
         """Кандидаты в ответ: (вес, правило, ключевое слово, позиция).
 
         Кроме сработавших правил сюда добавляется запасной ответ. Поэтому
         при высокой температуре Элиза охотно «сбивается» с точного правила
         на общую фразу — это видно и объяснимо.
+
+        Найденные ключевые слова передаются снаружи: decide() вызывает
+        _matches() один раз, чтобы и разбор, и кандидаты смотрели на
+        один и тот же результат поиска.
         """
-        matches = self._matches(words)
         if not matches:
             # Ни одного правила: для вопроса и для утверждения разный
             # запасной набор. «?» — самый дешёвый признак вопроса.
@@ -815,7 +886,7 @@ class Eliza:
 
         candidates: list[tuple[float, Rule, str, int]] = []
         # Больше трёх правил за раз — уже не Элиза, а лотерея.
-        for rank, (index, rule, keyword) in enumerate(matches[:3]):
+        for rank, (index, rule, keyword) in enumerate(matches[:MAX_RULES_PER_REPLY]):
             base = 2.0 if rank == 0 else 0.9
             candidates.append((base * (1.0 + rule.priority / 10), rule, keyword, index))
 
@@ -826,13 +897,17 @@ class Eliza:
     # ------------------------------------------------------------------
 
     def _replies(
-        self, candidates: list[tuple[float, Rule, str, int]], words: list[str]
+        self,
+        candidates: list[tuple[float, Rule, str, int]],
+        words: list[str],
+        trace: Decision,
     ) -> list[tuple[float, str]]:
         """Разворачивает правила в конкретные реплики с весами.
 
         Часть ответов отбрасывается: шаблон со звездочкой не годится,
         если после ключевого слова ничего не осталось («мне кажется»
-        -> «Возможно, *»).
+        -> «Возможно, *»). Почему именно этот шаблон выброшен — тоже
+        попадает в trace: иначе выглядит так, будто правило молчало.
         """
         replies: list[tuple[float, str]] = []
         seen: set[str] = set()
@@ -846,6 +921,26 @@ class Eliza:
             # («о вашей *») даст срамоту.
             fits = 0 < len(tail) <= MAX_TAIL_WORDS and tail[0] not in LEADING_PREPOSITIONS
 
+            if keyword and fits:
+                trace.note(f"хвост после «{keyword}»: «{' '.join(tail)}» → «{tail_text}»")
+            elif keyword and not tail:
+                trace.note(
+                    f"после «{keyword}» ничего не осталось — "
+                    "шаблоны со звёздочкой отброшены"
+                )
+            elif keyword and tail[0] in LEADING_PREPOSITIONS:
+                trace.note(
+                    f"хвост после «{keyword}» начинается с предлога «{tail[0]}»: "
+                    "шаблоны со звёздочкой отброшены"
+                )
+            elif keyword:
+                trace.note(
+                    f"хвост после «{keyword}» — "
+                    f"{plural(len(tail), 'слово', 'слова', 'слов')}, "
+                    "это не дополнение, а целая фраза: "
+                    "шаблоны со звёздочкой отброшены"
+                )
+
             for template in rule.responses:
                 if "*" in template and not fits:
                     continue
@@ -854,19 +949,39 @@ class Eliza:
                     seen.add(reply)
                     replies.append((score, reply))
 
+        trace.note(
+            f"кандидатов в ответ: "
+            f"{plural(len(replies), 'кандидат', 'кандидата', 'кандидатов')} — "
+            "выбираем по весам"
+        )
         return replies
 
-    def _choose(self, replies: list[tuple[float, str]], temperature: float) -> str:
+    def _choose(
+        self,
+        replies: list[tuple[float, str]],
+        temperature: float,
+        trace: Decision,
+    ) -> str:
         """Выбирает ответ. Здесь температура работает по-настоящему.
 
         Веса — те же степени, что у настоящих моделей: score ** (1 / T).
         При T = 0 берётся самая приоритетная реплика, при T = 2 Элиза
         позволяет себе отвечать общо и невпопад.
+
+        Все решения по пулу кандидатов записываются в trace: по журналу
+        видно, что варианты были — просто часть из них модель решила не
+        повторять.
         """
         if not replies:
+            trace.note("кандидатов нет вовсе — берём общую фразу")
             return random.choice(self.fallbacks)
 
         usable = [pair for pair in replies if pair[1] != self.last_reply] or list(replies)
+        if len(usable) < len(replies):
+            trace.note(
+                f"исключаем предыдущую реплику «{clip(self.last_reply)}» — "
+                "Элиза не повторяется"
+            )
 
         # Сначала то, что ещё не звучало: так Элиза не повторяет одну
         # и ту же реплику по кругу. Когда непрочитанные кончились —
@@ -875,12 +990,25 @@ class Eliza:
         pool = fresh or usable
         if not fresh:
             self.said.clear()
+            trace.note("все варианты уже звучали — память о повторах сбрасывается")
+        else:
+            trace.note(
+                f"из {plural(len(usable), 'варианта', 'вариантов', 'вариантов')} "
+                f"берём {plural(len(fresh), 'ещё не звучавший', 'ещё не звучавших', 'ещё не звучавших')}"
+            )
 
         if temperature <= 0:
+            trace.note("temperature=0: жадно берём вариант с максимальным весом")
             reply = max(pool, key=lambda pair: pair[0])[1]
         else:
             weights = [score ** (1.0 / temperature) for score, _ in pool]
+            total = sum(weights) or 1.0
             reply = random.choices([text for _, text in pool], weights=weights)[0]
+            chances = ", ".join(
+                f"{weight / total:.0%} «{clip(text, 40)}»"
+                for weight, (_, text) in zip(weights, pool)
+            )
+            trace.note(f"temperature={temperature:.2f}: вес = score ** (1 / T) → {chances}")
 
         self.said.add(reply)
         self.last_reply = reply
@@ -890,13 +1018,23 @@ class Eliza:
     # Публичный интерфейс
     # ------------------------------------------------------------------
 
-    def respond(
+    def _finish(self, trace: Decision, reply: str, max_tokens: int) -> Decision:
+        """Обрезает ответ по max_tokens и замыкает объяснение."""
+        trace.limited = len(reply.split()) > max_tokens
+        trace.reply = truncate(reply, max_tokens)
+
+        if trace.limited:
+            trace.note(f"max_tokens={max_tokens}: ответ обрезан до {max_tokens} слов")
+        trace.note(f"итог: «{clip(trace.reply, 120)}»")
+        return trace
+
+    def decide(
         self,
         message: str,
         max_tokens: int = 100,
         temperature: float | None = None,
-    ) -> str:
-        """Отвечает на реплику. Это главный вход для сервера.
+    ) -> Decision:
+        """Отвечает на реплику и объясняет, как дошла до ответа.
 
         Порядок повторяет устройство настоящей Элизы:
 
@@ -904,27 +1042,86 @@ class Eliza:
              получит русскую абракадабру вместо ответа на tool-calling;
           2. правила по ключевым словам;
           3. если ни одно правило не сработало — общая фраза.
+
+        Главный вход для сервера: тот показывает `steps` в журнале, и по
+        ним видно, что ответ — не выдумка, а результат работы таблицы
+        правил.
         """
+        trace = Decision(
+            temperature=DEFAULT_TEMPERATURE if temperature is None else temperature
+        )
         text = message.strip()
-        temp = DEFAULT_TEMPERATURE if temperature is None else temperature
 
-        agent_reply = agent_reply_of(text)
+        # 1. Служебный запрос агента
+        agent_key, agent_reply = agent_reply_of(text)
         if agent_reply:
-            return truncate(agent_reply, max_tokens)
+            trace.path = "заготовка агента"
+            trace.reason = agent_key
+            trace.note(f"запрос служебный: сработала заготовка по слову «{agent_key}»")
+            trace.note("правила не искали: такие фразы присылает агент, а не человек")
+            return self._finish(trace, agent_reply, max_tokens)
 
+        # 2. Слова реплики
         words = words_of(text)
         if not words:
-            return truncate(random.choice(self.fallbacks), max_tokens)
+            trace.path = "запасной ответ"
+            trace.reason = "пустая реплика"
+            trace.note("в реплике нет ни одного слова — спросить нечего")
+            return self._finish(trace, random.choice(self.fallbacks), max_tokens)
 
-        candidates = self._candidates(words, is_question="?" in text)
-        replies = self._replies(candidates, words)
+        trace.note(f"реплика: {plural(len(words), 'слово', 'слова', 'слов')} — «{clip(' '.join(words))}»")
+
+        # 3. Ключевые слова
+        matches = self._matches(words)
+        if matches:
+            trace.path = "правило"
+            trace.reason = matches[0][2]
+            trace.note(
+                f"ключевых слов нашлось {len(matches)}"
+                + (
+                    f", берём первые {MAX_RULES_PER_REPLY}"
+                    if len(matches) > MAX_RULES_PER_REPLY
+                    else ""
+                )
+            )
+            for index, rule, keyword in matches[:MAX_RULES_PER_REPLY]:
+                trace.note(f"«{keyword}» — позиция {index}, приоритет правила {rule.priority}")
+        else:
+            trace.path = "запасной ответ"
+            trace.reason = "ни одного ключевого слова"
+            trace.note(
+                "ни одного ключевого слова не нашлось, "
+                + ("а вопрос помечен знаком «?»" if "?" in text else "а вопроса в реплике нет")
+            )
+
+        candidates = self._candidates(words, matches, is_question="?" in text)
+
+        # 4. Кандидаты: правила разворачиваются в конкретные реплики
+        replies = self._replies(candidates, words, trace)
         if not replies:
             # Правило нашлось, но ответить ему нечем: короткий хвост
             # плюс все шаблоны со звёздочкой. Тогда — общая фраза.
             pool = QUESTION_FALLBACKS if "?" in text else self.fallbacks
+            trace.path = "запасной ответ"
+            trace.reason = "правило не ответило"
+            trace.note("подходящих реплик не осталось — берём общую фразу")
             replies = [(0.3, random.choice(pool))]
 
-        return truncate(self._choose(replies, temp), max_tokens)
+        # 5. Выбор из вариантов — здесь работает temperature
+        return self._finish(trace, self._choose(replies, trace.temperature, trace), max_tokens)
+
+    def respond(
+        self,
+        message: str,
+        max_tokens: int = 100,
+        temperature: float | None = None,
+    ) -> str:
+        """Отвечает на реплику. Это главный вход для разговора в терминале.
+
+        Серверу объяснение не нужно — только строка, поэтому он зовёт
+        decide() и показывает шаги в журнале. Здесь разбор выбрасывается.
+        """
+        return self.decide(message, max_tokens=max_tokens, temperature=temperature).reply
 
 
 # ---------------------------------------------------------------------------
