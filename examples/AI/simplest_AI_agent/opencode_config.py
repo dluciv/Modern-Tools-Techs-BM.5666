@@ -1,11 +1,20 @@
 """
 Сервисный модуль: чтение настроек opencode.
 
-Здесь нет ничего про агента и про инструменты — только два файла на диске
-и умение их прочитать:
+Здесь нет ничего про агента и про инструменты — только хранилища opencode
+на диске и умение их прочитать:
 
-  * ~/.local/share/opencode/auth.json   — API-ключи
-  * ~/.config/opencode/opencode.jsonc  — провайдеры, baseURL, модели
+  * ~/.local/share/opencode/opencode.db  — база opencode v2, API-ключи
+  * ~/.config/opencode/opencode.jsonc    — провайдеры, baseURL, модели
+
+Про ключи стоит знать главное. В v1 они лежали в отдельном файле
+auth.json. В v2 opencode хранит всё в одной базе, а ключи — в таблице
+credential, где значение записано строкой JSON вида {"type": "key", ...}.
+Поэтому здесь нужен sqlite3 — это стандартная библиотека Python, ничего
+доустанавливать не придётся.
+
+Базу мы открываем только на чтение (mode=ro) и только на время чтения:
+чужую базу не трогаем.
 
 Отдельный модуль нужен, чтобы в simple_ai_agent.py осталась только логика
 агента: диалог с моделью, вызов инструментов, цикл шагов.
@@ -14,6 +23,7 @@
 import json
 import os
 import re
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,8 +35,12 @@ def _xdg(env_var: str, default: str) -> Path:
     return Path(value) if value else Path.home() / default
 
 
-AUTH_FILE = _xdg("XDG_DATA_HOME", ".local/share") / "opencode" / "auth.json"
+DB_FILE = _xdg("XDG_DATA_HOME", ".local/share") / "opencode" / "opencode.db"
 CONFIG_FILE = _xdg("XDG_CONFIG_HOME", ".config") / "opencode" / "opencode.jsonc"
+
+# Старый путь v1. Нужен только как запасной вариант: если у кого-то
+# остался opencode v1, ключи лежат именно там.
+LEGACY_AUTH_FILE = _xdg("XDG_DATA_HOME", ".local/share") / "opencode" / "auth.json"
 
 
 # --------------------------------------------------------------------------- #
@@ -123,6 +137,86 @@ def mask_key(api_key: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# API-ключи
+# --------------------------------------------------------------------------- #
+
+# Колонка, где лежит сам ключ. Всё остальное (id, label, time_created)
+# — служебное, для работы демки не нужно.
+_KEY_QUERY = "SELECT integration_id, value FROM credential WHERE active IS NOT 0"
+
+
+def _from_database() -> dict[str, str]:
+    """Читает ключи из opencode.db.
+
+    Открываем в режиме mode=ro — sqlite3 не создаст файл, если его нет,
+    и не заблокирует базу, пока ею пользуется сам opencode.
+    """
+    uri = f"file:{DB_FILE}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        rows = connection.execute(_KEY_QUERY).fetchall()
+    finally:
+        # Закрываем сразу: база может быть занята работающим opencode
+        connection.close()
+
+    keys: dict[str, str] = {}
+    for integration_id, value in rows:
+        if not integration_id or not isinstance(value, str):
+            continue
+
+        # В v2 значение — это JSON-строка {"type": "key", "key": "sk-..."}.
+        # В будущем opencode может положить туда что-то другое (OAuth,
+        # refresh-токен), поэтому аккуратно проверяем тип и не падаем.
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict) or parsed.get("type") != "key":
+            continue
+
+        key = parsed.get("key")
+        if isinstance(key, str) and key:
+            keys[integration_id] = key
+
+    return keys
+
+
+def _from_legacy_file() -> dict[str, str]:
+    """Читает ключи из auth.json — формат opencode v1.
+
+    Оставлен для совместимости: у кого-то в аудитории может стоять v1.
+    В v2 этого файла уже нет.
+    """
+    try:
+        data = load_json(LEGACY_AUTH_FILE)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return {}
+
+    keys: dict[str, str] = {}
+    for integration_id, entry in data.items():
+        # В v1 значение бывает строкой, а бывает объектом {"key": ...}
+        key = entry.get("key") if isinstance(entry, dict) else entry
+        if isinstance(key, str) and key:
+            keys[integration_id] = key
+    return keys
+
+
+def load_api_keys() -> dict[str, str]:
+    """Все API-ключи, которые opencode знает: {провайдер: ключ}.
+
+    Сначала пробуем базу v2, и только если её нет — старый auth.json.
+    """
+    if DB_FILE.exists():
+        return _from_database()
+    return _from_legacy_file()
+
+
+def key_source() -> str:
+    """Откуда на самом деле взяты ключи — для честной надписи в логе."""
+    return str(DB_FILE) if DB_FILE.exists() else f"{LEGACY_AUTH_FILE} (v1)"
+
+
+# --------------------------------------------------------------------------- #
 # Провайдеры
 # --------------------------------------------------------------------------- #
 
@@ -138,14 +232,15 @@ class Provider:
 
 
 def available_providers() -> list[str]:
-    """Провайдеры, которые известны хотя бы одному из конфигов."""
+    """Провайдеры, которые известны базе ключей или конфигу."""
     names: set[str] = set()
 
-    if AUTH_FILE.exists():
-        try:
-            names |= set(load_json(AUTH_FILE))
-        except json.JSONDecodeError:
-            pass
+    try:
+        names |= set(load_api_keys())
+    except sqlite3.Error:
+        # База занята или повреждена — не падаем из-за списка, просто
+        # покажем то, что смогли прочитать
+        pass
 
     if CONFIG_FILE.exists():
         try:
@@ -156,36 +251,50 @@ def available_providers() -> list[str]:
     return sorted(names)
 
 
-def load_provider(provider_id: str) -> Provider:
-    """Читает ключ из auth.json, baseURL и модели — из opencode.jsonc.
+def configured_base_url(provider_id: str) -> str:
+    """baseURL провайдера из opencode.jsonc.
 
-    Бросает SystemExit с понятным текстом: для учебной демки важнее
-    объяснить, что починить, чем красивый traceback.
+    Отдельная функция нужна для --list-providers: там мы хотим увидеть
+    провайдера, даже если он не запускается. KeyError, а не SystemExit, —
+    вызывающий код сам решает, что написать.
     """
-    try:
-        auth = load_json(AUTH_FILE)
-    except FileNotFoundError as e:
-        raise SystemExit(
-            f"Ошибка: {e}\n"
-            f"Ожидаемый путь: {AUTH_FILE}\n"
-            "Войдите в opencode командой `/login`, чтобы он создал файл."
-        ) from e
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"Не удалось разобрать {AUTH_FILE}: {e}") from e
+    config = _read_config()
+    return str(config.get("providers", {})[provider_id]["settings"]["baseURL"]).rstrip("/")
 
+
+def _read_config() -> dict[str, Any]:
+    """Читает opencode.jsonc с понятными сообщениями об ошибках."""
     try:
-        config = load_json(CONFIG_FILE)
+        return load_json(CONFIG_FILE)
     except FileNotFoundError as e:
         raise SystemExit(f"Ошибка: {e}\nОжидаемый путь: {CONFIG_FILE}") from e
     except json.JSONDecodeError as e:
         raise SystemExit(f"Не удалось разобрать {CONFIG_FILE}: {e}") from e
 
+
+def load_provider(provider_id: str) -> Provider:
+    """Читает ключ из opencode.db, baseURL и модели — из opencode.jsonc.
+
+    Бросает SystemExit с понятным текстом: для учебной демки важнее
+    объяснить, что починить, чем красивый traceback.
+    """
+    try:
+        api_keys = load_api_keys()
+    except sqlite3.Error as e:
+        raise SystemExit(f"Не удалось прочитать {DB_FILE}: {e}") from e
+
+    config = _read_config()
+
     provider_cfg = config.get("providers", {}).get(provider_id)
     if provider_cfg is None:
-        known = ", ".join(available_providers()) or "(пусто)"
+        # Перечисляем именно настроенных провайдеров, а не всех, у кого
+        # нашёлся ключ: у провайдера без settings.baseURL запустить агента
+        # всё равно нельзя. Ключ без настройки — это половина провайдера.
+        configured = ", ".join(sorted(config.get("providers", {}))) or "(пусто)"
         raise SystemExit(
             f"Провайдер {provider_id!r} не найден в {CONFIG_FILE} (секция providers).\n"
-            f"Доступные провайдеры: {known}"
+            f"Настроенные провайдеры: {configured}\n"
+            f"Добавьте секцию providers.{provider_id} с settings.baseURL."
         )
 
     base_url = provider_cfg.get("settings", {}).get("baseURL")
@@ -195,25 +304,24 @@ def load_provider(provider_id: str) -> Provider:
         )
     base_url = base_url.rstrip("/")
 
-    # Ключ лежит в auth.json, но у локального сервера (ollama, учебный
+    # Ключ лежит в базе opencode, но у локального сервера (ollama, учебный
     # марковский сервер) авторизации нет — там ключ просто не нужен.
-    if provider_id in auth:
-        entry = auth[provider_id]
-        api_key = entry.get("key") if isinstance(entry, dict) else entry
-        if not api_key:
-            raise SystemExit(f"В {AUTH_FILE} у провайдера {provider_id!r} нет поля 'key'")
+    if provider_id in api_keys:
+        api_key = api_keys[provider_id]
     elif is_local(base_url):
         api_key = ""
         print(
-            f"[info] {provider_id!r} не найден в {AUTH_FILE}, "
-            f"но {base_url} локальный — идём без ключа"
+            f"[info] у провайдера {provider_id!r} нет ключа, "
+            f"но {base_url} локальный — идём без авторизации"
         )
     else:
-        known = ", ".join(available_providers()) or "(пусто)"
+        # Считаем по-настоящему: перечисляем тех, у кого ключ в базе
+        # действительно есть, а не всех настроенных подряд.
+        with_key = ", ".join(sorted(api_keys)) or "(ни у кого)"
         raise SystemExit(
-            f"Провайдер {provider_id!r} не найден в {AUTH_FILE}.\n"
-            f"Доступные провайдеры: {known}\n"
-            f"Добавьте его через `/login` в opencode."
+            f"Для провайдера {provider_id!r} не найден API-ключ в {key_source()}.\n"
+            f"Ключ есть у: {with_key}\n"
+            f"Добавьте ключ командой `/login` в opencode."
         )
 
     return Provider(

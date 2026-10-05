@@ -44,6 +44,7 @@
 
 import random
 import re
+import readline  # noqa: F401 — побочный эффект
 from dataclasses import dataclass, field
 from typing import ClassVar
 

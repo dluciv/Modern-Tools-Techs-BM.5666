@@ -31,16 +31,25 @@ Simple AI agent
     целиком, вместе с заголовками и статусом. История диалога повторяется
     в каждом запросе: так видно, что агент шлёт модели весь контекст.
 
+Про строку `import readline`. Мы импортируем модуль и нигде его не
+используем — и это как раз то, ради чего он нужен. Импорт readline
+подключает к input() редактирование строки: стрелки ←/→, история по ↑/↓,
+автодополнение по Tab. Само имя модуля после импорта нигде не нужно, и
+поэтому линтер (правило F401) считает импорт неиспользованным. Это
+ложное срабатывание, и `# noqa: F401` его отключает — в отличие от
+молчаливого удаления импорта, которое сломало бы ввод в REPL.
+
 Три файла рядом:
     simple_ai_agent.py  — этот файл: цикл агента
     safe_agent_tools.py — сами инструменты (калькулятор, ФС, поиск)
-    opencode_config.py  — чтение конфигов opencode (ключи, baseURL)
+    opencode_config.py  — чтение базы и конфига opencode (ключи, baseURL)
     agent_log.py        — журналы: пересказ в терминал и трассировка в файл
 """
 import argparse
 import json
 import os
 import re
+import readline  # noqa: F401 — побочный эффект
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -51,9 +60,12 @@ import requests
 
 from agent_log import ConversationLog, HttpTrace
 from opencode_config import (
-    AUTH_FILE,
     Provider,
     available_providers,
+    configured_base_url,
+    is_local,
+    key_source,
+    load_api_keys,
     load_provider,
     mask_key,
 )
@@ -428,7 +440,7 @@ class SafeAgent:
     def run(self) -> None:
         protocol = "native tools" if self.native_tools else "text JSON fallback"
         key_info = (
-            f"{mask_key(self.provider.api_key)} (из {AUTH_FILE})"
+            f"{mask_key(self.provider.api_key)} (из {key_source()})"
             if self.provider.api_key
             else "не требуется (локальный сервер)"
         )
@@ -527,8 +539,24 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.list_providers:
+        # Показываем не только имя, но и состояние: без baseURL провайдер
+        # не запустится, а без ключа запустится только если он локальный.
+        # Иначе список из восьми похожих строк ни о чём не говорит.
+        keys = load_api_keys()
         for name in available_providers():
-            print(name)
+            try:
+                base_url = configured_base_url(name)
+            except KeyError:
+                print(f"  {name:18s} — нет settings.baseURL, использовать нельзя")
+                continue
+            if name in keys:
+                state = f"ключ {mask_key(keys[name])}"
+            elif is_local(base_url):
+                state = "локальный, ключ не нужен"
+            else:
+                state = "нет ключа"
+            print(f"  {name:18s} {base_url:44s} {state}")
+        print(f"\nключи читаем из: {key_source()}")
         return
 
     provider = load_provider(args.provider)
