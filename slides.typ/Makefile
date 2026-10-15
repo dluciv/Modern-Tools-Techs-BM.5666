@@ -1,5 +1,5 @@
-FONT_PATH := res/fonts
-PDFs      := 01_0.C_Language_History.pdf
+FONT_PATH := ./spbu-se/fonts
+PDFs      := 01_0.C_Language_History.pdf 02_0.System_Shells.pdf
 
 .PHONY: all clean
 

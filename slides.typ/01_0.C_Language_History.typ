@@ -20,7 +20,7 @@
 #show: spbu-setup
 
 // ---- Титульный слайд ----
-#title-slide(
+#spbu-title-slide(
   logo1: image("spbu-se/spbu_grey.svg", height: 4.5em),
 )
 
