@@ -121,8 +121,9 @@ def create_app(config: Any, journal: Journal) -> Flask:
     def search() -> Any:
         query, k = _query_args()
         t0 = time.time()
-        hits = store.search(query, k=k)
+        result = store.search(query, k=k)
         elapsed = time.time() - t0
+        hits = result.hits
         journal.event(
             "→",
             f"search {query!r} (k={k})",
@@ -134,10 +135,20 @@ def create_app(config: Any, journal: Journal) -> Flask:
                 f"  #{hit.rank} {hit.path} :: {hit.heading} (score {hit.score:.5f}, vec={hit.vec_rank}, bm25={hit.bm25_rank})",
                 doc_id=hit.doc_id, score=hit.score,
             )
+        if result.not_found:
+            journal.event(
+                "⚠",
+                f"темы нет в каталоге, нет слов: {', '.join(result.terms.missing)}",
+                query=query, missing=result.terms.missing,
+            )
         return jsonify(
             {
                 "query": query,
                 "elapsed_ms": round(elapsed * 1000, 1),
+                "not_found": result.not_found,
+                "missing_terms": result.terms.missing,
+                "matched_terms": result.matched_terms,
+                "note": result.note,
                 "hits": [h.to_dict() for h in hits],
             }
         )
@@ -146,21 +157,26 @@ def create_app(config: Any, journal: Journal) -> Flask:
     def ask() -> Any:
         query, k = _query_args()
         t0 = time.time()
-        hits = store.search(query, k=k)
+        result = store.search(query, k=k)
+        hits = result.hits
         search_ms = round((time.time() - t0) * 1000, 1)
         journal.event("→", f"ask {query!r} (k={k}, найдено {len(hits)})", query=query, hits=len(hits))
         try:
-            answer = compose_answer(llm, query, hits)
+            answer = compose_answer(llm, query, result)
         except LLMError as e:
             # Ошибка модели — не ошибка поиска: фрагменты уже найдены,
             # и мы отдаём их с кодом 502, чтобы вызывающий увидел и то,
             # и другое.
             journal.event("⚠", f"модель: {e}")
             return jsonify({"error": str(e), "hits": [h.to_dict() for h in hits]}), 502
+        if answer.found:
+            outcome = f"источников {len(hits)}"
+        else:
+            outcome = "НЕ НАЙДЕНО, источники скрыты"
         journal.event(
             "←",
-            f"ответ {len(answer.text)} знаков, источников {len(hits)} ({search_ms} мс поиск)",
-            model=answer.model, answer_chars=len(answer.text),
+            f"ответ {len(answer.text)} знаков, {outcome} ({search_ms} мс поиск)",
+            model=answer.model, answer_chars=len(answer.text), found=answer.found,
         )
         payload = answer.to_dict()
         payload["search_ms"] = search_ms

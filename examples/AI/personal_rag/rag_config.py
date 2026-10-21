@@ -61,6 +61,8 @@ class Config:
     api_key_file: Path
     timeout: float
     max_tokens: int
+    # Потолок бюджета токенов для повтора, когда ответ обрезался по длине.
+    max_tokens_limit: int
     temperature: float
     # Параметры гибридного поиска (BM25 + kNN, слияние через RRF).
     vector_weight: float
@@ -169,7 +171,8 @@ def load_config(path: str | Path | None = None) -> Config:
         api_key=api_key,
         api_key_file=api_key_file,
         timeout=float(llm.get("timeout", 60)),
-        max_tokens=int(llm.get("max_tokens", 600)),
+        max_tokens=int(llm.get("max_tokens", 2000)),
+        max_tokens_limit=int(llm.get("max_tokens_limit", 8000)),
         temperature=float(llm.get("temperature", 0.2)),
         vector_weight=float(search.get("vector_weight", 1.0)),
         bm25_weight=float(search.get("bm25_weight", 1.0)),

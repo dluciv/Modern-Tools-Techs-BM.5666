@@ -300,8 +300,15 @@ def cmd_list(config: Config, args: argparse.Namespace) -> dict[str, Any]:
 def cmd_search(config: Config, args: argparse.Namespace) -> dict[str, Any]:
     store = Store(config)
     try:
-        hits = store.search(args.query, k=args.k)
-        return {"query": args.query, "hits": [h.to_dict() for h in hits]}
+        result = store.search(args.query, k=args.k)
+        return {
+            "query": args.query,
+            "not_found": result.not_found,
+            "missing_terms": result.terms.missing,
+            "matched_terms": result.matched_terms,
+            "note": result.note,
+            "hits": [h.to_dict() for h in result.hits],
+        }
     finally:
         store.close()
 

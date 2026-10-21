@@ -44,7 +44,7 @@ from typing import Any
 import sqlite_vec  # type: ignore[import-untyped]
 
 from rag_config import Config
-from rag_text import Chunk, Section, chunk_sections, lemmatize
+from rag_text import Chunk, Section, chunk_sections, lemmatize, stem, words
 
 # array.array в typeshed объявлен generic — array.array[float] означает
 # «массив C-двоичных float», ровно то, что принимает sqlite-vec.
@@ -127,6 +127,110 @@ class Hit:
             "vec_rank": self.vec_rank,
             "bm25_rank": self.bm25_rank,
         }
+
+
+# --------------------------------------------------------------------------- #
+# Разбор запроса по словам: есть ли тема в корпусе
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class TermInfo:
+    """Слово запроса и то, как оно выглядит в корпусе.
+
+    df — число чанков, в которых слово встречается (по колонке лемм).
+    present — есть ли слово в корпусе вообще. Оно может быть и при df == 0:
+    тогда слово найдено по префиксу (см. Store.query_terms), и df равен
+    числу совпадений по префиксу.
+    """
+
+    surface: str  # слово так, как его написал пользователь
+    lemma: str  # лемма — та же нормализация, что и в корпусе
+    df: int  # сколько чанков корпуса содержат это слово
+    present: bool  # встречается ли слово в корпусе
+
+
+@dataclass
+class QueryTerms:
+    """Разбор запроса: какие слова корпус знает, а какие нет.
+
+    Нужен, чтобы поиск не притворялся, что нашёл тему, которой в
+    каталоге нет. Слова запроса и слова корпуса нормализованы одинаково
+    (rag_text.lemmatize), поэтому «квантовые вычисления» превращается в
+    «квантовый вычисление», и по корпусу видно: «квантовый» не встречается
+    ни разу, а «вычисление» — 84 раза.
+    """
+
+    query: str
+    terms: list[TermInfo]
+
+    @property
+    def missing(self) -> list[str]:
+        """Слова запроса, которых нет в корпусе (в исходной форме)."""
+        return [t.surface for t in self.terms if not t.present]
+
+    @property
+    def rarest(self) -> TermInfo | None:
+        """Самое редкое слово запроса — обычно именно оно несёт тему.
+
+        «Вычисление» встречается в 84 чанках и само по себе ни о чём не
+        говорит, а «квантовый» не встречается ни разу: вопрос про
+        квантовые вычисления — это про то, чего в каталоге нет.
+        """
+        if not self.terms:
+            return None
+        return min(self.terms, key=lambda t: t.df)
+
+    @property
+    def not_found(self) -> bool:
+        """Темы, похоже, нет в корпусе: самое редкое слово запроса отсутствует.
+
+        Правило намеренно грубое и не блокирующее: это сигнал для
+        показа пользователю и для подсказки модели, а не запрет. Ложные
+        срабатывания бывают (слово есть в другой словоформе или корпус
+        пишет синоним), поэтому решение «найдено / не найдено» остаётся
+        за моделью, которая читает сами фрагменты.
+        """
+        rarest = self.rarest
+        if rarest is None:
+            return False
+        return not rarest.present
+
+
+@dataclass
+class SearchResult:
+    """Результат поиска: фрагменты + разбор запроса по словам."""
+
+    query: str
+    hits: list[Hit]
+    terms: QueryTerms
+
+    @property
+    def not_found(self) -> bool:
+        """Темы нет в корпусе (см. QueryTerms.not_found)."""
+        return self.terms.not_found
+
+    @property
+    def matched_terms(self) -> list[str]:
+        """Слова запроса, которые корпус знает."""
+        return [t.surface for t in self.terms.terms if t.present]
+
+    @property
+    def note(self) -> str:
+        """Пояснение к результату по-человечески (пусто, если вопросов нет).
+
+        Флаги в JSON легко потерять, а фрагменты — легко принять за ответ.
+        Одна строка прямо говорит, что нашлось и почему.
+        """
+        missing = self.terms.missing
+        if not missing:
+            return ""
+        listed = ", ".join(f"«{w}»" for w in missing)
+        if self.not_found:
+            return (
+                f"Темы в каталоге нет: в документах не встречаются слова {listed}. "
+                "Найденные фрагменты совпали только по остальным словам запроса."
+            )
+        return f"В каталоге не встречаются слова {listed}."
 
 
 # --------------------------------------------------------------------------- #
@@ -248,6 +352,9 @@ class Store:
         self.db_path = self.config.store_dir / "rag.sqlite3"
         self.embedder = Embedder(config.embedding_model, config.cache_dir)
         self._db: sqlite3.Connection | None = None
+        # Кэш частот слов: подсчёт df — запрос к FTS, а запросы повторяются
+        # (один и тот же вопрос из разных инструментов).
+        self._df_cache: dict[str, int] = {}
 
     # -- соединение и схема ------------------------------------------------ #
 
@@ -516,11 +623,93 @@ class Store:
 
     # -- поиск ------------------------------------------------------------- #
 
-    def search(self, query: str, k: int = 5) -> list[Hit]:
-        """Гибридный поиск: BM25 по леммам + kNN по векторам, слияние RRF."""
+    def query_terms(self, query: str) -> QueryTerms:
+        """Разбирает запрос по словам и проверяет каждое по корпусу.
+
+        Слово считается найденным, если его лемма встречается в колонке
+        лемм FTS-индекса. Если точного совпадения нет, делается мягкая
+        проверка по основе слова (rag_text.stem) — по леммам и по сырому
+        тексту. Она нужна для расхождений словоформ: корпус пишет
+        «Геделя», а пользователь спрашивает про «Гёделя» (ё ≠ е), и без
+        запаса слово выглядит отсутствующим.
+
+        Короткие слова (2 символа и короче) пропускаются: это почти всегда
+        либо служебные слова, либо аббревиатуры («NP», «n»), которых в
+        прозрачном корпусе просто нет, — и из-за них запрос выглядел бы
+        «не найденным» на пустом месте.
+
+        Числа и прочие токены без букв тоже пропускаются: номера документов
+        («082426») в тексте фрагментов не встречаются.
+        """
+        terms: list[TermInfo] = []
+        for surface in words(query.lower()):
+            if not any(ch.isalpha() for ch in surface):
+                continue
+            if len(surface) <= 2:
+                continue
+            lemma = lemmatize(surface)
+            if not lemma:
+                continue
+            df = self._df(lemma)
+            present = df > 0
+            if not present:
+                # Мягкий запас на словоизменение и словообразование:
+                # «Гёделя» → «гедел*», «криптография» → «криптограф*».
+                # Основу короче 5 букв не ищем: она слишком коротка, чтобы
+                # надёжно отличать слова — по «шор» нашлось бы «шорение».
+                base = stem(surface)
+                if len(base) >= 5:
+                    df = max(self._df_prefix("lemmas", base), self._df_prefix("text", base))
+                    present = df > 0
+            terms.append(TermInfo(surface=surface, lemma=lemma, df=df, present=present))
+        return QueryTerms(query=query, terms=terms)
+
+    def _df(self, lemma: str) -> int:
+        """Сколько чанков корпуса содержат слово (по колонке лемм)."""
+        cached = self._df_cache.get(lemma)
+        if cached is not None:
+            return cached
+        try:
+            row = self.db.execute(
+                "SELECT count(*) AS n FROM chunks_fts WHERE chunks_fts MATCH ?",
+                ('"' + lemma.replace('"', '""') + '"',),
+            ).fetchone()
+            df = int(row["n"])
+        except sqlite3.OperationalError:
+            # Слово непригодно для синтаксиса FTS — считаем, что его нет.
+            df = 0
+        self._df_cache[lemma] = df
+        return df
+
+    def _df_prefix(self, column: str, prefix: str) -> int:
+        """Сколько чанков содержат слово, начинающееся с префикса."""
+        key = f"{column}:{prefix}"
+        cached = self._df_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            row = self.db.execute(
+                f"SELECT count(*) AS n FROM chunks_fts WHERE {column} MATCH ?",
+                ('"' + prefix.replace('"', '""') + '"*',),
+            ).fetchone()
+            df = int(row["n"])
+        except sqlite3.OperationalError:
+            df = 0
+        self._df_cache[key] = df
+        return df
+
+    def search(self, query: str, k: int = 5) -> SearchResult:
+        """Гибридный поиск: BM25 по леммам + kNN по векторам, слияние RRF.
+
+        Возвращает не только фрагменты, но и разбор запроса по словам
+        (QueryTerms): поиск по леммам идёт через OR, поэтому запрос про
+        отсутствующую тему («квантовые вычисления») находит фрагменты по
+        второму слову. Разбор запроса показывает, что темы в корпусе нет.
+        """
         query = query.strip()
+        terms = self.query_terms(query)
         if not query:
-            return []
+            return SearchResult(query=query, hits=[], terms=terms)
         limit = max(self.config.candidates, k)
 
         bm25_hits = self._bm25(query, limit)
@@ -552,7 +741,7 @@ class Store:
 
         ordered = sorted(scores, key=lambda cid: scores[cid], reverse=True)[:k]
         if not ordered:
-            return []
+            return SearchResult(query=query, hits=[], terms=terms)
 
         placeholders = ",".join("?" for _ in ordered)
         rows = self.db.execute(
@@ -582,7 +771,7 @@ class Store:
                     bm25_rank=bm25_rank.get(chunk_id),
                 )
             )
-        return hits
+        return SearchResult(query=query, hits=hits, terms=terms)
 
     def _bm25(self, query: str, limit: int) -> list[int]:
         """FTS5-поиск по леммам запроса. Пустой результат — не ошибка:

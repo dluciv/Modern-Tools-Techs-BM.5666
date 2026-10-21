@@ -43,6 +43,7 @@ _WORD_RE = re.compile(r"\w+", re.UNICODE)
 # но и не пересоздаётся на каждый чанк.
 _MORPH: pymorphy3.MorphAnalyzer | None = None
 _STEMMER = _stemmer("english")
+_STEMMER_RU = _stemmer("russian")
 
 
 def _morph() -> pymorphy3.MorphAnalyzer:
@@ -82,6 +83,26 @@ def lemmatize(text: str) -> str:
 def words(text: str) -> list[str]:
     """Простая токенизация: слова для подсчёта размера чанка."""
     return _WORD_RE.findall(text)
+
+
+def stem(word: str) -> str:
+    """Основа слова — чтобы мягко искать варианты написания.
+
+    Лемма (pymorphy3) хороша для словоизменения, но не для словообразования:
+    запрос «криптография» и корпусное «криптографический» — разные леммы,
+    и без запаса слово выглядит отсутствующим. Основа обрезается по обоим
+    концам сразу, поэтому «криптография» и «криптографический» дают одну
+    основу «криптограф», а «Гёделя» и «Геделя» — «гедел».
+
+    «ё» приводится к «е»: в корпусе «ё» пишут по-разному, и без этого
+    запрос про «Гёделя» не нашёл бы «Геделя».
+    """
+    word = word.lower().replace("ё", "е")
+    if not word:
+        return ""
+    if "Ѐ" <= word[0] <= "ӿ":
+        return _STEMMER_RU.stemWord(word)
+    return _STEMMER.stemWord(word)
 
 
 @dataclass

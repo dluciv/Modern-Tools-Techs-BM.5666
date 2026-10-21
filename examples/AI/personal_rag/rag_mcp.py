@@ -88,10 +88,21 @@ def search(query: str, k: int = 5) -> str:
     """Найти фрагменты документов по запросу (гибридно: векторы + BM25 по леммам).
 
     Возвращает JSON: путь к файлу, заголовок раздела, текст фрагмента и оценку.
+    Если темы нет в каталоге, not_found = true и missing_terms перечисляет
+    слова запроса, которых в документах нет.
     """
-    hits = store().search(query, k=k)
+    result = store().search(query, k=k)
     return json.dumps(
-        {"query": query, "hits": [h.to_dict() for h in hits]}, ensure_ascii=False, indent=2
+        {
+            "query": query,
+            "not_found": result.not_found,
+            "missing_terms": result.terms.missing,
+            "matched_terms": result.matched_terms,
+            "note": result.note,
+            "hits": [h.to_dict() for h in result.hits],
+        },
+        ensure_ascii=False,
+        indent=2,
     )
 
 
@@ -100,15 +111,19 @@ def ask(question: str, k: int = 5) -> str:
     """Ответить на вопрос по документам: найдёт фрагменты и спросит дешёвую модель.
 
     Возвращает JSON с answer и sources (номера цитат соответствуют фрагментам).
+    Если в документах ответа нет, found = false и sources пуст: показывать
+    источники к ответу «ничего не нашлось» нечестно.
     """
-    hits = store().search(question, k=k)
+    result = store().search(question, k=k)
     try:
-        answer = compose_answer(llm(), question, hits)
+        answer = compose_answer(llm(), question, result)
     except LLMError as e:
         # Модель может быть не настроена — фрагменты всё равно отдаём,
         # чтобы поиск оставался полезным.
         return json.dumps(
-            {"error": str(e), "hits": [h.to_dict() for h in hits]}, ensure_ascii=False, indent=2
+            {"error": str(e), "hits": [h.to_dict() for h in result.hits]},
+            ensure_ascii=False,
+            indent=2,
         )
     return json.dumps(answer.to_dict(), ensure_ascii=False, indent=2)
 
