@@ -46,11 +46,23 @@ from rag_text import Section, normalize
 # Расширения, которые умеем разбирать сами; остальное — через pandoc.
 TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".rst", ".org", ".log", ".csv", ".tsv"}
 PANDOC_SUFFIXES = {
-    ".adoc", ".org", ".tex", ".html", ".htm", ".epub", ".rtf", ".odt", ".doc"
+    ".adoc",
+    ".tex",
+    ".html",
+    ".htm",
+    ".epub",
+    ".rtf",
+    ".odt",
+    ".doc",
+    ".docx",
+    ".pptx",
+    ".xlsx",
+    ".xls",
 }
 # Форматы, которые разбираются надёжно и без внешних программ.
 OFFICE_SUFFIXES = {".pdf", ".docx", ".xlsx", ".xlsm", ".pptx"}
-SUPPORTED_SUFFIXES = TEXT_SUFFIXES | OFFICE_SUFFIXES
+# Обход каталога должен видеть всё, что parse_file умеет обработать.
+SUPPORTED_SUFFIXES = TEXT_SUFFIXES | OFFICE_SUFFIXES | PANDOC_SUFFIXES
 
 # Нумерованный заголовок без стиля Heading: «Раздел 1. Характеристики…»,
 # «1.1. Цели и задачи…», «2.1.1 Основной курс». Именно так оформлена
@@ -488,24 +500,101 @@ def parse_pptx(path: Path) -> ParsedDoc:
 # pandoc — универсальный фолбэк
 # --------------------------------------------------------------------------- #
 
-def parse_pandoc(path: Path) -> ParsedDoc:
-    """Любой формат, который знает pandoc (html, odt, tex, epub, …)."""
+_PANDOC_FROM = {
+    ".adoc": "asciidoc",
+    ".doc": "doc",
+    ".docx": "docx",
+    ".epub": "epub",
+    ".htm": "html",
+    ".html": "html",
+    ".odt": "odt",
+    ".pptx": "pptx",
+    ".rtf": "rtf",
+    ".tex": "latex",
+    ".xls": "xls",
+    ".xlsx": "xlsx",
+}
+
+
+def _pandoc_to_markdown(path: Path) -> str:
+    """Пробует прочесть файл через pandoc, явно указав входной формат."""
     if shutil.which("pandoc") is None:
         raise ParseError(
             f"формат {path.suffix or '(без расширения)'} не поддержан напрямую, "
             f"а pandoc не установлен — чтобы разобрать {path.name}, поставьте pandoc"
         )
+    suffix = path.suffix.lower()
+    cmd = ["pandoc", "-t", "markdown", "--wrap=none", str(path)]
+    fmt = _PANDOC_FROM.get(suffix)
+    if fmt:
+        cmd = ["pandoc", "-f", fmt, "-t", "markdown", "--wrap=none", str(path)]
     try:
-        result = subprocess.run(
-            ["pandoc", "-f", "auto", "-t", "markdown", "--wrap=none", str(path)],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=True,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=True)
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        # pandoc 3.x не всегда умеет читать старый .doc напрямую — пробуем через LibreOffice
+        if suffix == ".doc" and shutil.which("soffice"):
+            return _soffice_to_markdown(path, "docx")
+        if suffix == ".xls" and shutil.which("soffice"):
+            return _soffice_to_markdown(path, "xlsx")
+        msg = stderr.splitlines()[-1] if stderr else str(e)
+        raise ParseError(f"pandoc не смог разобрать {path.name}: {msg}") from e
     except (subprocess.SubprocessError, OSError) as e:
         raise ParseError(f"pandoc не смог разобрать {path.name}: {e}") from e
-    return parse_text(result.stdout, path)
+    return result.stdout
+
+
+def _soffice_to_markdown(path: Path, target_ext: str) -> str:
+    """Конвертирует бинарные/старые офисные форматы в понятный pandoc через LibreOffice."""
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        raise ParseError(f"не удалось разобрать {path.name}: нужен pandoc или LibreOffice")
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="rag-pandoc-") as td:
+        outdir = Path(td)
+        try:
+            subprocess.run(
+                [soffice, "--headless", "--invisible", "--nologo", "--nofirststartwizard",
+                 "--convert-to", target_ext, "--outdir", str(outdir), str(path)],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=True,
+            )
+        except (subprocess.SubprocessError, OSError) as e:
+            raise ParseError(f"LibreOffice не смог сконвертировать {path.name}: {e}") from e
+        converted = outdir / (path.stem + "." + target_ext)
+        if not converted.is_file():
+            # LibreOffice может чуть иначе назвать файл
+            candidates = list(outdir.glob("*." + target_ext))
+            if not candidates:
+                raise ParseError(f"LibreOffice не создал конвертированный файл для {path.name}")
+            converted = candidates[0]
+        fmt = target_ext if target_ext in ("docx", "xlsx") else "docx"
+        try:
+            result = subprocess.run(
+                ["pandoc", "-f", fmt, "-t", "markdown", "--wrap=none", str(converted)],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            msg = stderr.splitlines()[-1] if stderr else str(e)
+            raise ParseError(f"pandoc не смог разобрать {path.name} после конвертации: {msg}") from e
+        except (subprocess.SubprocessError, OSError) as e:
+            raise ParseError(f"pandoc не смог разобрать {path.name} после конвертации: {e}") from e
+        return result.stdout
+
+
+def parse_pandoc(path: Path) -> ParsedDoc:
+    """Любой формат, который знает pandoc (html, odt, tex, epub, rtf, doc, …)."""
+    text = _pandoc_to_markdown(path)
+    if not text.strip():
+        raise ParseError(f"из {path.name} pandoc не извлёк текста")
+    return parse_text(text, path)
 
 
 # --------------------------------------------------------------------------- #
@@ -524,8 +613,13 @@ def parse_file(path: Path) -> ParsedDoc:
         return parse_docx(path)
     if suffix in {".xlsx", ".xlsm"}:
         return parse_xlsx(path)
+    if suffix in {".xls"}:
+        # .xls (старый Excel) — парсить нативно сложнее; надёжнее через LibreOffice/pandoc
+        return parse_pandoc(path)
     if suffix in {".pptx"}:
         return parse_pptx(path)
+    if suffix in {".doc"}:
+        return parse_pandoc(path)
     if suffix in TEXT_SUFFIXES:
         try:
             text = path.read_text(encoding="utf-8")
