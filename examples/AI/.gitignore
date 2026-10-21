@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Simple RAG: ключи, данные, кэш моделей, журналы
+personal_rag/keys.env
+personal_rag/data/
+personal_rag/data_test/
+personal_rag/.model_cache/
+personal_rag/*.log
