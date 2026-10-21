@@ -380,6 +380,17 @@ class Store:
                 )
                 doc_id = last_id(cur)
             else:
+                # Сначала вычищаем векторы и FTS-строки: виртуальные таблицы
+                # не знают каскадов, а rowid у чанков переиспользуются —
+                # если оставить осиротевшие строки, повторная запись того же
+                # rowid упадёт на UNIQUE chunks_vec.
+                stale = [
+                    int(r["id"])
+                    for r in conn.execute("SELECT id FROM chunks WHERE doc_id = ?", (doc_id,))
+                ]
+                for cid in stale:
+                    conn.execute("DELETE FROM chunks_vec WHERE rowid = ?", (cid,))
+                    conn.execute("DELETE FROM chunks_fts WHERE rowid = ?", (cid,))
                 conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
                 conn.execute(
                     "UPDATE documents SET title = ?, lang = ?, format = ?, chars = ?,"
@@ -418,6 +429,38 @@ class Store:
         self.db.executemany(
             "INSERT INTO chunks_fts (rowid, lemmas, text) VALUES (?, ?, ?)", fts_rows
         )
+
+    def prune(self) -> dict[str, int]:
+        """Убирает осиротевшие строки в chunks_vec / chunks_fts.
+
+        Сироты появляются, если чанки удаляются минуя виртуальные таблицы
+        (как в старом баге upsert): rowid у чанков переиспользуются, и
+        осиротевший вектор мешает новой записи того же rowid, а попав в
+        kNN-выдачу — отвечает пустотой, потому что строки чанка уже нет.
+        Безопасно запускать сколько угодно раз: удаляется только то, чему
+        соответствующего чанка в базе нет.
+        """
+        conn = self.db
+        chunk_ids = {int(r["id"]) for r in conn.execute("SELECT id FROM chunks")}
+        orphans = {
+            table: sorted({int(r[0]) for r in conn.execute(f"SELECT rowid FROM {table}")} - chunk_ids)
+            for table in ("chunks_vec", "chunks_fts")
+        }
+        removed = 0
+        with conn:
+            for table, ids in orphans.items():
+                for rowid in ids:
+                    conn.execute(f"DELETE FROM {table} WHERE rowid = ?", (rowid,))
+                    removed += 1
+        # Чанк без вектора невидим для поиска, но виден в цитатах —
+        # это тоже расхождение, его показываем, а не чиним молча.
+        missing = len(chunk_ids - {int(r[0]) for r in conn.execute("SELECT rowid FROM chunks_vec")})
+        return {
+            "orphan_vec": len(orphans["chunks_vec"]),
+            "orphan_fts": len(orphans["chunks_fts"]),
+            "removed": removed,
+            "chunks_without_vec": missing,
+        }
 
     def remove(self, path_or_id: str | int) -> bool:
         """Удаляет документ и все его чанки. Возвращает, был ли он в базе."""

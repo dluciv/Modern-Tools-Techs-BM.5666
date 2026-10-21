@@ -33,6 +33,17 @@
     list                      что лежит в базе
     search ЗАПРОС             найти фрагменты (без ответа модели — для отладки)
     scan                      сравнить каталог и базу: новое/изменённое/удалённое
+    plan КАТАЛОГ              манифест по каталогу: сводка по каждому файлу
+    apply МАНИФЕСТ            загрузить в базу документы из манифеста
+    reindex                   пере-чанковать документы текущим парсером
+    prune                     убрать осиротевшие векторы/FTS-строки
+
+Пакетный сценарий — тот, которым пользуются чаще всего, — состоит из
+трёх шагов и от модели требует только содержание документов:
+
+    plan КАТАЛОГ -o plan.json     разобрать все файлы и описать их
+    (модель вписывает аннотации)  единственное место, где нужно думать
+    apply plan.json               положить всё в каталог и в базу
 """
 
 from __future__ import annotations
@@ -51,7 +62,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent))
 
 from rag_config import Config, load_config
-from rag_parse import ParseError, parse_file
+from rag_parse import SUPPORTED_SUFFIXES, ParseError, parse_file
 from rag_store import Store
 from rag_text import Digest, detect_lang, estimate_tokens
 
@@ -70,7 +81,7 @@ def lexical_abs(path: Path) -> Path:
 
     Нужно, чтобы файл за симлинком внутри каталога считался частью
     каталога: Path.resolve() следовал бы по симлинку наружу, и путь
-    «extra/zayavki.md» превратился бы в абсолютный путь к чужому файлу.
+    превратился бы в абсолютный путь к чужому файлу.
     os.path.abspath делает только normpath — ровно то, что нужно.
     """
     return Path(os.path.abspath(path))
@@ -86,6 +97,24 @@ def rel_path(config: Config, path: Path) -> str:
         return str(lexical_abs(path).relative_to(config.catalog_dir))
     except ValueError:
         return str(lexical_abs(path))
+
+
+def resolve_key(config: Config, target: str, known: set[str]) -> str:
+    """Ключ документа в базе по тому, что дал пользователь.
+
+    Указанное имя может быть путём относительно текущего каталога (так
+    работают все файловые команды) либо тем, как документ записан в базе —
+    относительно каталога документов (так печатает `list`). Второе поддерживаем:
+    иначе `remove zapiska.md` после `list` превращается в гонку «попадёт ли
+    текущий каталог в каталог документов».
+    """
+    given = Path(target).expanduser()
+    candidates = [given] if given.is_absolute() else [given, config.catalog_dir / given]
+    for candidate in candidates:
+        rel = rel_path(config, candidate)
+        if rel in known:
+            return rel
+    raise SystemExit(f"документа {target} в базе нет")
 
 
 def make_digest(config: Config, path: Path, parsed: Any) -> Digest:
@@ -148,6 +177,9 @@ def _place_in_catalog(config: Config, path: Path) -> Path:
     пути, который завтра может исчезнуть). Симлинк не делаем: он ломается
     при переносе каталога. Сравнение лексическое (см. lexical_abs): файл
     за симлинком внутри каталога уже «свой», копировать его не нужно.
+
+    Тот же файл, уже лежащий в каталоге, повторно не копируется: иначе
+    повторный импорт одной и той же папки наплодил бы копии «-2», «-3».
     """
     source = lexical_abs(path)
     catalog = config.catalog_dir
@@ -155,6 +187,8 @@ def _place_in_catalog(config: Config, path: Path) -> Path:
         return source  # уже внутри каталога — в том числе за симлинком
     target = catalog / source.name
     if target.exists():
+        if sha256_of(target) == sha256_of(source):
+            return target  # тот же самый документ — копия не нужна
         # Не затираем чужой файл молча: имя конфликтует — добавляем числовой суффикс.
         stem, suffix = target.stem, target.suffix
         n = 2
@@ -240,9 +274,12 @@ def cmd_update(config: Config, args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_remove(config: Config, args: argparse.Namespace) -> dict[str, Any]:
     """Удаляет документ из базы. Файл в каталоге остаётся — база и каталог независимы."""
-    key: str | int = int(args.target) if str(args.target).isdigit() else rel_path(config, Path(args.target).expanduser())
     store = Store(config)
     try:
+        key: str | int = (
+            int(args.target) if str(args.target).isdigit()
+            else resolve_key(config, args.target, {d.path for d in store.documents()})
+        )
         found = store.remove(key)
         if not found:
             raise SystemExit(f"документа {key} в базе нет")
@@ -321,6 +358,258 @@ def cmd_scan(config: Config, args: argparse.Namespace) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Пакетная работа: план → разметка → применение
+# --------------------------------------------------------------------------- #
+
+def _walk_documents(root: Path) -> list[Path]:
+    """Поддерживаемые файлы под корнем, по возрастанию пути.
+
+    Скрытые файлы и каталоги пропускаются: там обычно лежат артефакты
+    редакторов, а не документы.
+    """
+    found: list[Path] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        if path.suffix.lower() not in SUPPORTED_SUFFIXES:
+            continue
+        found.append(path)
+    return found
+
+
+def cmd_plan(config: Config, args: argparse.Namespace) -> dict[str, Any]:
+    """Собирает манифест по каталогу: что вообще есть и как это читается.
+
+    Ничего не пишет в базу и ничего не меняет на диске — только читает
+    файлы и описывает их. Дальше модель (или субагент-разметчик) вписывает
+    в манифест аннотации, а команда apply кладёт всё в базу.
+
+    Смысл разделения: механику (обход каталога, разбор форматов, выбор
+    названий, копирование, чанкинг, эмбеддинги) делает инструмент
+    одинаково и безошибочно, а содержание читает и пересказывает модель.
+    """
+    root = Path(args.root).expanduser().resolve()
+    if not root.is_dir():
+        raise SystemExit(f"каталог не найден: {root}")
+    entries: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for file in _walk_documents(root):
+        rel = str(file.relative_to(root))
+        try:
+            parsed = parse_file(file)
+            digest = make_digest(config, file, parsed)
+        except ParseError as e:
+            errors.append({"path": rel, "error": str(e)})
+            continue
+        body = "\n\n".join(s.text for s in parsed.sections)
+        entries.append({
+            "path": str(file),
+            "rel": rel,
+            "title": digest.title,
+            "lang": digest.lang,
+            "chars": digest.chars,
+            "chunks": digest.n_chunks,
+            "toc": [{"level": lvl, "heading": name} for lvl, name in digest.toc],
+            "head": body[: args.head_chars],
+            "warning": _warnings(digest),
+            "annotation": "",
+        })
+    manifest = {"root": str(root), "files": entries}
+    parts: list[str] = []
+    if args.split and args.split > 1:
+        if not args.output:
+            raise SystemExit("для --split нужен -o: имя файла манифеста")
+        out = Path(args.output).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Части — нарезанные манифесты: их удобно раздать нескольким
+        # разметчикам параллельно, каждый работает со своим файлом.
+        size = (len(entries) + args.split - 1) // args.split
+        for i in range(args.split):
+            chunk = entries[i * size : (i + 1) * size]
+            if not chunk:
+                continue
+            part_path = out.with_name(f"{out.stem}.part-{i + 1}{out.suffix or '.json'}")
+            part_path.write_text(
+                json.dumps({"root": str(root), "files": chunk}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            parts.append(str(part_path))
+        return {"root": str(root), "files": entries, "manifest": str(out), "parts": parts, "errors": errors}
+    return {"root": str(root), "files": entries, "parts": parts, "errors": errors}
+
+
+def _read_manifests(paths: list[str]) -> list[tuple[str, dict[str, Any]]]:
+    """Читает манифесты и возвращает пары (корень, запись о файле).
+
+    Битый или чужой файл — это ошибка вызывающего, а не сбой программы:
+    трейсбек здесь никому не нужен, достаточно внятного сообщения в stderr
+    и кода возврата 1 (main превращает SystemExit со строкой в код 1).
+    """
+    entries: list[tuple[str, dict[str, Any]]] = []
+    for path in paths:
+        source = Path(path).expanduser()
+        try:
+            raw = source.read_text(encoding="utf-8")
+        except OSError as e:
+            raise SystemExit(f"манифест не прочитан: {source} — {e.strerror or e}")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"манифест не разобран ({source}): {e.msg}, строка {e.lineno}")
+        if not isinstance(data, dict) or not isinstance(data.get("files"), list):
+            raise SystemExit(f"это не манифест из plan: в {source} нет поля files-списка")
+        root = str(data.get("root", ""))
+        for entry in data["files"]:
+            if isinstance(entry, dict):
+                entries.append((root, entry))
+    return entries
+
+
+def cmd_apply(config: Config, args: argparse.Namespace) -> dict[str, Any]:
+    """Кладёт в базу всё, что перечислено в манифестах.
+
+    Один процесс на весь список: модель эмбеддингов грузится один раз, а
+    не по разу на документ. Ошибка в одном файле не роняет остальные —
+    она попадает в список failed, а процесс идёт дальше.
+    """
+    entries = _read_manifests(args.manifests)
+    store = Store(config)
+    added: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    failed: list[dict[str, str]] = []
+    missing: list[str] = []
+    try:
+        for root, entry in entries:
+            raw = str(entry.get("path", ""))
+            source = Path(raw).expanduser()
+            if not source.is_absolute() and root:
+                source = Path(root) / raw
+            if not source.is_file():
+                failed.append({"path": raw, "error": "файл не найден"})
+                continue
+            annotation = str(entry.get("annotation") or "").strip()
+            if not annotation:
+                missing.append(raw)
+                continue
+            try:
+                stored = _place_in_catalog(config, source)
+                key = rel_path(config, stored)
+                existing = store.by_path(key)
+                if existing and existing.sha256 == sha256_of(stored) and not args.force:
+                    skipped.append({"path": key, "id": existing.id, "reason": "уже в базе, файл не менялся"})
+                    continue
+                parsed = parse_file(stored)
+                digest = make_digest(config, stored, parsed)
+                title = str(entry.get("title") or "").strip() or parsed.title
+                doc = store.upsert(
+                    rel_path=key,
+                    title=title,
+                    sections=parsed.sections,
+                    toc=parsed.toc,
+                    annotation=annotation,
+                    lang=digest.lang,
+                    fmt=stored.suffix.lower(),
+                    sha256=sha256_of(stored),
+                    mtime=stored.stat().st_mtime,
+                )
+                added.append(doc.to_dict())
+            except ParseError as e:
+                failed.append({"path": raw, "error": str(e)})
+    finally:
+        store.close()
+    return {
+        "added": added,
+        "skipped": skipped,
+        "failed": failed,
+        "missing_annotation": missing,
+    }
+
+
+def cmd_prune(config: Config, args: argparse.Namespace) -> dict[str, Any]:
+    """Убирает осиротевшие векторы/FTS-строки, оставшиеся от старых ошибок.
+
+    Ничего не пересчитывает и эмбеддингов не трогает: удаляются только
+    записи, которым в таблице chunks уже нет соответствия. Приносит
+    пользу ровно один раз — после бага, из-за которого чанки удалялись
+    минуя виртуальные таблицы; дальше команда просто ничего не находит.
+    """
+    store = Store(config)
+    try:
+        return store.prune()
+    finally:
+        store.close()
+
+
+def cmd_reindex(config: Config, args: argparse.Namespace) -> dict[str, Any]:
+    """Перечитывает файлы каталога и пере-чанковывает их текущим парсером.
+
+    Нужен после правки rag_parse.py: хеш файла не меняется, поэтому
+    update и scan --apply не срабатывают, а содержимое в базе уже не
+    соответствует тому, как файл разбирается сейчас. Аннотация и
+    заголовок при этом сохраняются — перечитывается только текст.
+    """
+    store = Store(config)
+    try:
+        docs = store.documents()
+        if args.paths:
+            # Путь можно дать как есть (относительно текущего каталога)
+            # и как он лежит в базе — относительно каталога документов:
+            # список файлов печатает `list` именно в таком виде.
+            known = {d.path for d in docs}
+            wanted: set[str] = set()
+            unknown: list[dict[str, str]] = []
+            for raw in args.paths:
+                try:
+                    wanted.add(resolve_key(config, raw, known))
+                except SystemExit:
+                    unknown.append({"path": raw, "error": "нет такого документа в базе"})
+            docs = [d for d in docs if d.path in wanted]
+        else:
+            unknown = []
+        reindexed: list[dict[str, Any]] = []
+        failed: list[dict[str, str]] = []
+        for doc in docs:
+            file = config.catalog_dir / doc.path
+            if not file.is_file():
+                failed.append({"path": doc.path, "error": "файл не найден в каталоге"})
+                continue
+            try:
+                parsed = parse_file(file)
+                digest = make_digest(config, file, parsed)
+                # Название по умолчанию не трогаем: его могли поправить вручную
+                # (--title), и перезаписывать чужую правку нельзя. С --titles
+                # название пересчитывается — так чинят авто-заголовки, когда
+                # алгоритм в парсере уже исправили.
+                new = store.upsert(
+                    rel_path=doc.path,
+                    title=parsed.title if args.titles else doc.title,
+                    sections=parsed.sections,
+                    toc=parsed.toc,
+                    annotation=doc.annotation,
+                    lang=digest.lang,
+                    fmt=file.suffix.lower(),
+                    sha256=sha256_of(file),
+                    mtime=file.stat().st_mtime,
+                )
+            except ParseError as e:
+                failed.append({"path": doc.path, "error": str(e)})
+                continue
+            reindexed.append({
+                "path": doc.path,
+                "title": new.title,
+                "chunks_before": doc.n_chunks,
+                "chunks_after": new.n_chunks,
+            })
+        return {"reindexed": reindexed, "failed": failed + unknown}
+    finally:
+        store.close()
+
+
+# --------------------------------------------------------------------------- #
 # Разбор аргументов
 # --------------------------------------------------------------------------- #
 
@@ -369,6 +658,30 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("scan", parents=[common], help="сравнить каталог и базу")
     p.add_argument("--apply", action="store_true", help="переиндексировать изменённые файлы")
 
+    p = sub.add_parser("plan", parents=[common],
+                       help="собрать манифест по каталогу (ничего не пишет в базу)")
+    p.add_argument("root", help="каталог с документами (обход рекурсивный)")
+    p.add_argument("-o", "--output", default="", help="куда сохранить манифест (по умолчанию — stdout)")
+    p.add_argument("--split", type=int, default=0,
+                   help="нарезать манифест на N частей (для параллельной разметки)")
+    p.add_argument("--head-chars", type=int, default=2500,
+                   help="сколько символов начала текста класть в манифест")
+
+    p = sub.add_parser("apply", parents=[common],
+                       help="загрузить в базу документы из манифеста (по аннотациям)")
+    p.add_argument("manifests", nargs="+", help="файлы манифеста (можно несколько)")
+    p.add_argument("--force", action="store_true", help="перезаписать, если документ уже есть")
+
+    p = sub.add_parser("reindex", parents=[common],
+                       help="перечитать файлы каталога и пере-чанковать их (после правки парсера)")
+    p.add_argument("paths", nargs="*", help="пути относительно каталога; без них — все документы")
+    p.add_argument("--all", action="store_true", help="переиндексировать все документы базы")
+    p.add_argument("--titles", action="store_true",
+                   help="пересчитать и названия (по умолчанию названия сохраняются)")
+
+    p = sub.add_parser("prune", parents=[common],
+                       help="убрать осиротевшие векторы и FTS-строки без чанков")
+
     return parser
 
 
@@ -397,9 +710,13 @@ def print_human(data: dict[str, Any]) -> None:
             print(f"обновлён: [{doc['id']}] {doc['path']} — {doc['title']} (чанков: {doc['chunks']})")
         else:
             print(f"не тронут: {doc['path']} — {data['reason']}")
-    elif "added" in data:
+    elif "added" in data and isinstance(data["added"], dict):
         doc = data["added"]
         print(f"добавлен: [{doc['id']}] {doc['path']} — {doc['title']} (чанков: {doc['chunks']})")
+    elif "orphan_vec" in data:
+        print(f"удалено сирот: векторов {data['orphan_vec']}, FTS-строк {data['orphan_fts']}")
+        if data.get("chunks_without_vec"):
+            print(f"внимание: чанков без вектора {data['chunks_without_vec']} — их нужно переиндексировать (reindex)")
     elif "removed" in data:
         print(f"удалён: {data['removed']}")
     elif "title" in data:
@@ -408,6 +725,28 @@ def print_human(data: dict[str, Any]) -> None:
             print(f"  {'  ' * (item['level'] - 1)}{item['heading']}")
         if data.get("warning"):
             print(f"внимание: {data['warning']}")
+    elif "reindexed" in data:
+        for item in data["reindexed"]:
+            print(f"пере-чанкован: {item['path']} — чанков {item['chunks_before']} → {item['chunks_after']}")
+        for item in data.get("failed", []):
+            print(f"ошибка: {item['path']} — {item['error']}")
+    elif "added" in data and isinstance(data["added"], list):
+        for doc in data["added"]:
+            print(f"добавлен: [{doc['id']}] {doc['path']} — {doc['title']} (чанков: {doc['chunks']})")
+        for item in data.get("skipped", []):
+            print(f"пропущен: {item['path']} ({item['reason']})")
+        for item in data.get("failed", []):
+            print(f"ошибка: {item['path']} — {item['error']}")
+        for item in data.get("missing_annotation", []):
+            print(f"нет аннотации: {item}")
+    elif "files" in data:
+        print(f"каталог: {data.get('root', '?')}")
+        for item in data["files"]:
+            print(f"  {item['rel']} — {item['title']} ({item['chars']} знаков, чанков: {item['chunks']})")
+        for part in data.get("parts", []):
+            print(f"часть: {part}")
+        for item in data.get("errors", []):
+            print(f"ошибка: {item['path']} — {item['error']}")
     else:
         print(json.dumps(data, ensure_ascii=False, indent=2))
 
@@ -428,6 +767,10 @@ def main(argv: list[str] | None = None) -> int:
         "list": cmd_list,
         "search": cmd_search,
         "scan": cmd_scan,
+        "plan": cmd_plan,
+        "apply": cmd_apply,
+        "reindex": cmd_reindex,
+        "prune": cmd_prune,
     }
     try:
         result = handlers[args.command](config, args)
@@ -443,6 +786,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         print_human(result)
+    # Пакетные команды умеют частично провалиться: apply — из-за
+    # недостающих аннотаций, reindex — из-за нечитаемых файлов. Код
+    # возврата говорит вызывающему, что «всё прошло» неправда.
+    if result.get("failed") or result.get("missing_annotation"):
+        return 1
     return 0
 
 

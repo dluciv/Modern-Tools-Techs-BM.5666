@@ -12,10 +12,19 @@
 цитаты в ответах. Поэтому:
 
   * Markdown — заголовки ATX (# …) и setext (подчёркивание);
-  * Word — стили Heading 1..9 (это и есть реальная структура документа);
+  * Word — стили Heading 1..9 (это и есть реальная структура документа),
+    а если стилей нет — нумерованные полужирные строки («Раздел 1.»,
+    «1.1. Цели и задачи»): в рабочих программах дисциплин структура
+    оформлена именно так, и без неё документ превращается в один
+    безголовый кусок текста;
   * PDF — закладки (outline) из самого PDF, если автор их сделал;
   * PowerPoint — заголовок слайда;
   * Excel — листы как разделы, строки таблиц через табуляцию.
+
+Абзацы внутри раздела разделяются пустой строкой: чанкер режет текст по
+пустой строке, и склейка абзацев одиночным переводом строки склеила бы
+документ в один гигантский чанк, который ни эмбеддер (обрезает до
+512 токенов), ни поиск по нему не увидит по-настоящему.
 
 Название документа: берётся первый смыслительный заголовок или, если его
 нет, имя файла без расширения. Ручной заголовок всегда можно передать
@@ -39,6 +48,14 @@ TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".rst", ".org", ".log", ".csv", ".t
 PANDOC_SUFFIXES = {
     ".adoc", ".org", ".tex", ".html", ".htm", ".epub", ".rtf", ".odt", ".doc"
 }
+# Форматы, которые разбираются надёжно и без внешних программ.
+OFFICE_SUFFIXES = {".pdf", ".docx", ".xlsx", ".xlsm", ".pptx"}
+SUPPORTED_SUFFIXES = TEXT_SUFFIXES | OFFICE_SUFFIXES
+
+# Нумерованный заголовок без стиля Heading: «Раздел 1. Характеристики…»,
+# «1.1. Цели и задачи…», «2.1.1 Основной курс». Именно так оформлена
+# структура рабочих программ дисциплин СПбГУ.
+_NUMBERED_HEADING_RE = re.compile(r"^(?:Раздел\s+\d+\.?|\d+(?:\.\d+)*\.?)\s", re.IGNORECASE)
 
 
 class ParseError(RuntimeError):
@@ -62,11 +79,100 @@ def _title_from_name(path: Path) -> str:
 
 
 def _first_heading(parsed: ParsedDoc, path: Path) -> str:
-    """Первый заголовок первого уровня — лучшее название документа."""
+    """Первый заголовок первого уровня — лучшее название документа.
+
+    Служебные заголовки вида «Раздел 1. Характеристики учебных занятий»
+    названием быть не могут: они одинаковы у всех рабочих программ
+    дисциплин. Заголовки, начинающиеся с цифры («1 курс (осенний семестр)…»),
+    — тоже: это пункты содержания, а не имя документа. Такие пропускаем —
+    тогда сработает запасной вариант (имя файла), а для документа с
+    настоящим заголовком — он и останется.
+    """
     for level, heading in parsed.toc:
-        if level == 1 and heading.strip():
-            return heading.strip()
+        text = heading.strip()
+        if level == 1 and text and not text.lower().startswith("раздел") \
+                and not text[0].isdigit():
+            return text
     return _title_from_name(path)
+
+
+def _title_from_block(lines: list[str]) -> str:
+    """Название из «шапки» документа: строка после «…ДИСЦИПЛИНЫ» / «…ПРАКТИКИ».
+
+    Шапка рабочих программ дисциплин устроена одинаково, даже когда
+    стили Heading не проставлены: учреждение → «Р А Б О Ч А Я
+    П Р О Г Р А М М А» → «ДИСЦИПЛИНЫ» → название дисциплины →
+    английское название. Названия нет ни в имени файла (там префикс
+    «РПД»), ни в первом заголовке (там «Раздел 1.» или имя университета),
+    зато оно есть в самом документе — берём его оттуда.
+    """
+    for i, line in enumerate(lines[:-1]):
+        # «П Р А К Т И К И» и «учебной дисциплины» сводятся к одному виду.
+        flat = re.sub(r"\s+", "", line).lower()
+        if not re.search(r"дисциплин[ыей]$|практики$", flat):
+            continue
+        name = ""
+        for candidate in lines[i + 1 :]:
+            part = re.sub(r"\s+", " ", candidate).strip()
+            if not part:
+                continue
+            if not name:
+                if 3 <= len(part) <= 120:
+                    name = part
+                    continue
+                break  # непустая, но непохожая на название — дальше не ищем
+            # Название может кончаться двоеточием, а продолжение идти
+            # следующей строкой («…практика:» / «разработка веб-приложений»).
+            # Склеиваем, пока строка-начало ждёт продолжения.
+            if name.endswith((":", "：")) and 3 <= len(part) <= 120:
+                name = f"{name} {part}"
+                continue
+            break
+        if name:
+            return name
+    return ""
+
+
+def _reg_number(lines: list[str], path: Path) -> str:
+    """Регистрационный номер рабочей программы: из шапки, иначе из имени файла.
+
+    В шапке он бывает выставлен криво («¿050503¿»), пустым или заглушкой
+    («XXXXXX», «??????») — такое не годится. Тогда берём цифры в начале
+    имени файла: они появляются там именно как номер программы. Если и их
+    нет, возвращаем пустую строку — названия без номера лучше, чем
+    выдуманный.
+    """
+    for line in lines:
+        m = re.search(r"[Рр]егистрационный номер[^:：]*[:：]\s*(\S+)", line)
+        if not m:
+            continue
+        number = re.sub(r"[^\w./-]", "", m.group(1))
+        if number and number[0].isdigit() and len(number) >= 4:
+            return number
+        break  # номер в шапке есть, но он пустой/буквенный — не выдумываем
+    m = re.match(r"(\d{4,})", path.stem)
+    return m.group(1) if m else ""
+
+
+def _title_from_preamble(path: Path, lines: list[str]) -> str:
+    """Название из «шапки» (текст до первого заголовка), либо пустая строка.
+
+    Пустая строка — не ошибка, а сигнал «шапка не содержала названия,
+    возьми первый заголовок / имя файла»: документы разных типов устроены
+    по-разному, и универсального места, где лежит название, не существует.
+
+    Регистрационный номер ставим перед названием: он один у документа,
+    помогает отличать одноимённые практики и семинары и так же записан
+    в именах файлов каталога.
+    """
+    title = _title_from_block(lines)
+    if not title:
+        return ""
+    title = re.sub(r"\s+", " ", title).strip().rstrip(":;,. ")
+    number = _reg_number(lines, path)
+    if number and not title.startswith(number):
+        return f"{number} {title}"
+    return title
 
 
 # --------------------------------------------------------------------------- #
@@ -151,14 +257,17 @@ def parse_pdf(path: Path) -> ParsedDoc:
         pass
 
     parsed = ParsedDoc(title="", sections=sections, toc=toc)
-    # У PDF нет стиля Title, зато первая строка первой страницы чаще всего
-    # и есть название документа — берём её, если она похожа на заголовок
-    # (короткая и без точки на конце).
-    first_line = sections[0].text.splitlines()[0].strip() if sections else ""
-    if 0 < len(first_line) <= 80 and not first_line.endswith((".", ":", ";")):
-        parsed.title = first_line
-    else:
-        parsed.title = _first_heading(parsed, path)
+    # Название берём из «шапки» первой страницы: она одинаково устроена у
+    # рабочих программ («…ПРОГРАММА» → «ДИСЦИПЛИНЫ» → название). Первая
+    # строка страницы хуже: там чаще всего стоит название университета.
+    first_page = sections[0].text.splitlines() if sections else []
+    parsed.title = _title_from_preamble(path, first_page)
+    if not parsed.title:
+        first_line = first_page[0].strip() if first_page else ""
+        if 0 < len(first_line) <= 80 and not first_line.endswith((".", ":", ";")):
+            parsed.title = first_line
+        else:
+            parsed.title = _first_heading(parsed, path)
     if not parsed.title or parsed.title.startswith("стр."):
         parsed.title = _title_from_name(path)
     if not sections:
@@ -204,8 +313,37 @@ def _pdf_outline(reader: object) -> list[tuple[int, str]]:
 # Word
 # --------------------------------------------------------------------------- #
 
+def _heading_level(text: str) -> int:
+    """Уровень заголовка по его номеру: «Раздел 1.» → 1, «1.1.» → 2, «2.1.1» → 3."""
+    if text.lower().startswith("раздел"):
+        return 1
+    m = re.match(r"^(\d+(?:\.\d+)*)\.?\s", text)
+    if not m:
+        return 2
+    return min(3, m.group(1).count(".") + 1)
+
+
+def _bold_heading(para: object) -> str:
+    """Заголовок «жирным текстом» с номером — либо пустая строка.
+
+    Рабочие программы дисциплин СПбГУ не используют стили Heading:
+    структура («Раздел 1.», «1.1. Цели и задачи») набрана полужирным
+    начертанием. Без такого распознавания документ читается как один
+    безголовый кусок текста: в оглавлении пусто, у всех чанков один
+    заголовок «(без заголовка)», а структура теряется и для поиска,
+    и для цитат в ответах.
+    """
+    text = para.text.strip()  # type: ignore[attr-defined]
+    if not text or not _NUMBERED_HEADING_RE.match(text):
+        return ""
+    runs = [r for r in para.runs if r.text.strip()]  # type: ignore[attr-defined]
+    if not runs or not all(r.bold for r in runs):
+        return ""
+    return text
+
+
 def parse_docx(path: Path) -> ParsedDoc:
-    """Word: разделы по стилям Heading, таблицы — как текст ячеек через таб."""
+    """Word: разделы по стилям Heading и по полужирной нумерации, таблицы — как текст ячеек через таб."""
     try:
         import docx
     except ImportError as e:  # pragma: no cover
@@ -218,9 +356,12 @@ def parse_docx(path: Path) -> ParsedDoc:
     level = 1
     title_line = ""
     buf: list[str] = []
+    preamble: list[str] = []  # текст до первого заголовка — «шапка» документа
 
     def flush() -> None:
-        body = "\n".join(buf).strip()
+        # Абзацы разделяем пустой строкой: чанкер режет текст по пустой
+        # строке, и без неё весь раздел склеится в один нечитаемый чанк.
+        body = "\n\n".join(buf).strip()
         if heading or body:
             sections.append(Section(heading=heading, text=body, level=level))
         buf.clear()
@@ -242,20 +383,34 @@ def parse_docx(path: Path) -> ParsedDoc:
             heading = para.text.strip()
             toc.append((level, heading))
         elif para.text.strip():
-            buf.append(para.text.strip())
+            bold_heading = _bold_heading(para)
+            if bold_heading:
+                flush()
+                level = _heading_level(bold_heading)
+                heading = bold_heading
+                toc.append((level, heading))
+            else:
+                buf.append(para.text.strip())
+                if not toc:  # до первого заголовка — это «шапка»
+                    preamble.extend(t for t in para.text.strip().splitlines() if t.strip())
     flush()
 
     for table in document.tables:
         rows = []
         for row in table.rows:
-            rows.append("\t".join(cell.text.strip() for cell in row.cells))
+            # Переводы строк внутри ячейки схлопываем в пробел: иначе
+            # одна ячейка разорвёт строку таблицы на части.
+            cells = [" ".join(cell.text.split()) for cell in row.cells]
+            rows.append("\t".join(cells))
         if rows:
-            buf.append("\n".join(rows))
+            # Каждая строка таблицы — отдельный абзац: большие таблицы
+            # (тематический план, матрица компетенций) иначе не режутся.
+            buf.append("\n\n".join(rows))
     if buf:
-        sections.append(Section(heading="Таблицы", text="\n".join(buf), level=2))
+        sections.append(Section(heading="Таблицы", text="\n\n".join(buf), level=2))
 
     parsed = ParsedDoc(title="", sections=sections, toc=toc)
-    parsed.title = title_line or _first_heading(parsed, path)
+    parsed.title = title_line or _title_from_preamble(path, preamble) or _first_heading(parsed, path)
     return parsed
 
 
@@ -279,7 +434,9 @@ def parse_xlsx(path: Path) -> ParsedDoc:
             cells = ["" if v is None else str(v).strip() for v in row]
             if any(cells):
                 rows.append("\t".join(cells).rstrip("\t"))
-        sections.append(Section(heading=sheet.title, text="\n".join(rows), level=1))
+        # Строки таблицы — отдельные абзацы: иначе лист склеится в один
+        # чанк на десятки тысяч символов.
+        sections.append(Section(heading=sheet.title, text="\n\n".join(rows), level=1))
         toc.append((1, sheet.title))
     book.close()
 
