@@ -7,6 +7,39 @@ The source code lives in `../src/main.c`; this directory contains a symlink
 This example uses Conan 2 to download/build a specific zlib version (`1.3.1`)
 and generates files for CMake (`CMakeToolchain` and `CMakeDeps`).
 
+## How this build works
+
+Conan and CMake do separate jobs here: Conan resolves a zlib *package* and
+generates the CMake files needed to consume it; CMake only builds this project
+against those generated files. No zlib source is downloaded into the project.
+
+1. `conan profile detect --force` (done once on a fresh installation) records
+   the OS, compiler, C/C++ library settings and default build type in a profile.
+   Conan uses it to select a zlib binary that matches the local toolchain.
+2. `conan install . --output-folder=build/conan-<mode> --build=missing
+   -s build_type=<Release|Debug>` reads `conanfile.txt`. It resolves
+   `zlib/1.3.1` from a remote, downloads the matching binary (or builds it from
+   the recipe when `--build=missing` allows that), stores it in the Conan
+   cache, and runs the declared generators: `CMakeDeps` writes `ZLIBConfig.cmake`
+   and target files describing zlib's headers and libraries, while
+   `CMakeToolchain` writes `conan_toolchain.cmake` carrying the compiler, flags
+   and paths from the profile. `[layout] cmake_layout` decides where these files
+   land; the path of `conan_toolchain.cmake` differs between single- and
+   multi-config generators, so it has to be looked up rather than hardcoded.
+3. CMake is configured with that toolchain file (`-DCMAKE_TOOLCHAIN_FILE=...`).
+   Its `find_package(ZLIB REQUIRED)` consumes the Conan-generated config instead
+   of searching the system, and `target_link_libraries(zlibdemo PRIVATE
+   ZLIB::ZLIB)` uses the imported target from it. `cmake --build` then runs Ninja
+   or Make to compile `src/main.c` and link the binary; generator expressions
+   apply the mode-specific defines and flags.
+
+The split is deliberate: the dependency is versioned and cached outside the
+project by Conan, while CMake stays an ordinary project that only sees a normal
+`find_package` result. Conan packages are settings-specific, so each mode gets
+its own Conan install and its own CMake build directory. The generator and
+`CMAKE_MAKE_PROGRAM` are passed explicitly at configure time because minimal
+systems may otherwise leave `CMAKE_MAKE_PROGRAM` unset.
+
 ## Prerequisites
 
 - GCC or another C compiler
